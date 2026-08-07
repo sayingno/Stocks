@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# scanner artifacts
+data/cache/
+data/demo/
+out/
+*.png
+!docs/*.png

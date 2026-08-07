@@ -1,0 +1,5 @@
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+# Optional data providers - stooq and tiingo need no extra package.
+yfinance>=0.2.40
