@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd job for the daily scan.
+
+  Unlike cron, launchd catches up on a missed run when the Mac wakes, which is
+  what you want for a job scheduled after the close on a laptop that sleeps.
+
+  Install:
+    1. Edit the two /Users/YOU/Stocks paths below.
+    2. cp scripts/com.qscan.daily.plist ~/Library/LaunchAgents/
+    3. launchctl load -w ~/Library/LaunchAgents/com.qscan.daily.plist
+
+  Check on it:   launchctl list | grep qscan
+  Run it now:    launchctl start com.qscan.daily
+  Remove it:     launchctl unload -w ~/Library/LaunchAgents/com.qscan.daily.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.qscan.daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOU/Stocks/scripts/daily_scan.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOU/Stocks</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>QSCAN_UNIVERSE</key>
+        <string>us_all</string>
+        <key>QSCAN_PRESET</key>
+        <string>default</string>
+        <key>QSCAN_CHARTS</key>
+        <string>25</string>
+    </dict>
+
+    <!-- 17:30 local, Monday through Friday. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/Stocks/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/Stocks/logs/launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

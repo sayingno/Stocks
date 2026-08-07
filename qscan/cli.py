@@ -1,8 +1,12 @@
 """Command line entry point.
 
+    python -m qscan update   --universe us_all                # refresh the price database
+    python -m qscan daily    --universe us_all                # update + scan + charts + report
     python -m qscan scan     --universe sample                # today's candidates
     python -m qscan history  --universe sample --years 5      # past setups + charts
     python -m qscan explain  --symbol NVDA --date 2023-05-24  # why it did/didn't pass
+
+`daily` is the one to schedule. Everything else is for exploring by hand.
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +26,8 @@ from .config import PRESETS, BreakoutConfig
 from .data import DataError, PriceStore, default_window
 from .indicators import annotate
 from .outcomes import TradeRules, forward_returns, simulate_trade, summarise
+from .report import build_report
+from .repository import PriceRepository
 from .setup_breakout import _Arrays, dedupe_signals, evaluate_bar, scan_symbol
 
 SCAN_COLUMNS = [
@@ -58,13 +64,42 @@ def _build_config(args: argparse.Namespace) -> BreakoutConfig:
     return cfg.with_overrides(**overrides) if overrides else cfg
 
 
-def _make_store(args: argparse.Namespace) -> PriceStore:
-    return PriceStore(
-        provider=args.provider,
-        cache_dir=args.cache_dir,
-        csv_dir=args.csv_dir,
-        offline=args.offline,
-    )
+class _Source:
+    """Uniform read interface over either the price database or the ad-hoc cache.
+
+    `--repo DIR` reads the incrementally-maintained database written by
+    `qscan update`, which is what a scheduled run should use: no network, no
+    per-symbol staleness checks. Without it, symbols are fetched on demand.
+    """
+
+    def __init__(self, args: argparse.Namespace):
+        repo_dir = getattr(args, "repo", None)
+        if repo_dir:
+            self.repo: PriceRepository | None = PriceRepository(
+                root=repo_dir, provider=args.provider, csv_dir=args.csv_dir
+            )
+            self.name = f"db:{repo_dir}"
+        else:
+            self.repo = None
+            self.store = PriceStore(
+                provider=args.provider,
+                cache_dir=args.cache_dir,
+                csv_dir=args.csv_dir,
+                offline=args.offline,
+            )
+            self.name = self.store.name
+
+    def get(self, symbol: str, start: str, end: str, refresh: bool = False) -> pd.DataFrame:
+        if self.repo is None:
+            return self.store.get(symbol, start, end, refresh=refresh)
+        df = self.repo.load(symbol)
+        if df is None or df.empty:
+            raise DataError(f"{symbol}: not in the price database (run `qscan update`)")
+        return df.loc[str(start) : str(end)]
+
+
+def _make_store(args: argparse.Namespace) -> _Source:
+    return _Source(args)
 
 
 def _write(df: pd.DataFrame, path: Path, columns: list[str]) -> Path:
@@ -224,6 +259,180 @@ def cmd_history(args: argparse.Namespace) -> int:
     return 0
 
 
+def _progress(done: int, total: int, stats) -> None:
+    print(
+        f"  {done}/{total}  +{stats.new_rows:,} bars  "
+        f"({stats.created} new, {stats.appended} appended, {stats.failed} failed)",
+        file=sys.stderr,
+    )
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    """Bring the local price database up to date. Safe to interrupt and re-run."""
+    repo = PriceRepository(
+        root=args.repo or "data",
+        provider=args.provider,
+        csv_dir=args.csv_dir,
+        history_years=args.history_years,
+    )
+    symbols = universe_mod.load(args.universe)
+    print(f"updating {len(symbols)} symbols from {repo.provider_name} …", file=sys.stderr)
+
+    stats = repo.update(
+        symbols,
+        workers=args.workers,
+        pause=args.pause,
+        force=args.force,
+        progress=_progress if args.verbose else None,
+    )
+    print(json.dumps({"update": stats.as_dict(), "coverage": repo.coverage()}, indent=2, default=str))
+    return 0
+
+
+def cmd_daily(args: argparse.Namespace) -> int:
+    """The scheduled job: refresh data, apply the filters, render charts, write a report."""
+    started = datetime.now()
+    cfg = _build_config(args)
+    repo_root = args.repo or "data"
+    repo = PriceRepository(
+        root=repo_root, provider=args.provider, csv_dir=args.csv_dir, history_years=args.history_years
+    )
+    symbols = universe_mod.load(args.universe)
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # ---- 1. refresh ---------------------------------------------------------
+    update_stats: dict[str, Any] = {}
+    problems: list[str] = []
+    if args.skip_update:
+        print("skipping data refresh (--skip-update)", file=sys.stderr)
+    else:
+        print(f"[1/4] refreshing {len(symbols)} symbols from {repo.provider_name} …", file=sys.stderr)
+        stats = repo.update(
+            symbols,
+            workers=args.workers,
+            pause=args.pause,
+            force=args.force,
+            progress=_progress if args.verbose else None,
+        )
+        update_stats = stats.as_dict()
+        print(
+            f"      +{stats.new_rows:,} bars · {stats.created} new · {stats.appended} appended · "
+            f"{stats.readjusted} re-adjusted · {stats.failed} failed",
+            file=sys.stderr,
+        )
+        # A scheduled job that silently reports "0 candidates" because the feed
+        # broke is worse than one that fails loudly.
+        if stats.checked:
+            fail_ratio = stats.failed / stats.checked
+            if fail_ratio > args.max_failure_ratio:
+                problems.append(
+                    f"{stats.failed}/{stats.checked} fetches failed "
+                    f"({fail_ratio:.0%} > {args.max_failure_ratio:.0%} allowed)"
+                )
+
+    coverage = repo.coverage()
+    latest = coverage.get("latest_date")
+    if latest:
+        stale_days = (date.today() - date.fromisoformat(str(latest))).days
+        if stale_days > args.max_stale_days:
+            problems.append(f"newest bar is {latest} ({stale_days} days old)")
+    elif not args.skip_update:
+        problems.append("price database is empty")
+
+    # ---- 2. filter ----------------------------------------------------------
+    print(f"[2/4] applying filters to {len(symbols)} symbols …", file=sys.stderr)
+    rows: list[dict[str, Any]] = []
+    rs_input: dict[str, float] = {}
+    frames: dict[str, pd.DataFrame] = {}
+    missing = 0
+    for sym in symbols:
+        df = repo.load(sym)
+        if df is None or len(df) < 140:
+            missing += 1
+            continue
+        ann = annotate(df, cfg)
+        if pd.notna(ann["ret_3m"].iloc[-1]):
+            rs_input[sym] = float(ann["ret_3m"].iloc[-1])
+        hits = scan_symbol(df, cfg, symbol=sym)
+        if hits:
+            rows.extend(hits)
+            frames[sym] = ann
+
+    if rows:
+        out = pd.DataFrame(rows)
+        if rs_input:
+            ranks = pd.Series(rs_input).rank(pct=True) * 100
+            out["rs_63d_rank"] = out["symbol"].map(ranks).round(1)
+        out = out[out["score"] >= args.min_score]
+        if args.state:
+            out = out[out["state"] == args.state]
+        out = out.sort_values("score", ascending=False).reset_index(drop=True)
+    else:
+        out = pd.DataFrame(columns=["symbol", "state", "score"])
+    print(f"      {len(out)} candidates ({missing} symbols short on history)", file=sys.stderr)
+
+    # ---- 3. charts ----------------------------------------------------------
+    stamp = date.today().isoformat()
+    chart_dir = outdir / "charts" / stamp
+    chart_paths: dict[str, str] = {}
+    if len(out) and args.charts:
+        print(f"[3/4] rendering top {min(args.charts, len(out))} charts …", file=sys.stderr)
+        for _, row in out.head(args.charts).iterrows():
+            sym = row["symbol"]
+            try:
+                p = plot_signal(frames[sym], row.to_dict(), chart_dir / f"{sym}.png")
+                chart_paths[sym] = str(p)
+            except Exception as exc:
+                print(f"      chart failed for {sym}: {exc}", file=sys.stderr)
+    else:
+        print("[3/4] no charts to render", file=sys.stderr)
+
+    # ---- 4. report ----------------------------------------------------------
+    print("[4/4] writing report …", file=sys.stderr)
+    csv_path = outdir / f"scan_{stamp}.csv"
+    _write(out, csv_path, SCAN_COLUMNS)
+    report_path = build_report(
+        out,
+        outdir / f"report_{stamp}.html",
+        charts=chart_paths,
+        update_stats=update_stats,
+        coverage=coverage,
+        universe_size=len(symbols),
+        config_note=f"preset {args.preset}",
+    )
+    latest = outdir / "latest.html"
+    latest.write_text(report_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    elapsed = (datetime.now() - started).total_seconds()
+    summary = {
+        "date": stamp,
+        "universe": len(symbols),
+        "candidates": len(out),
+        "breakouts": int((out.get("state") == "breakout").sum()) if len(out) else 0,
+        "setups": int((out.get("state") == "setup").sum()) if len(out) else 0,
+        "charts": len(chart_paths),
+        "report": str(report_path),
+        "latest": str(latest),
+        "csv": str(csv_path),
+        "data_as_of": coverage.get("latest_date"),
+        "elapsed_sec": round(elapsed, 1),
+        "problems": problems,
+    }
+    print(json.dumps(summary, indent=2, default=str))
+    if len(out):
+        print()
+        _print_table(out, ["symbol", "state", "score", "close", "pivot", "entry", "stop",
+                           "risk_pct", "shares", "adr20", "impulse_gain", "base_len"], args.limit)
+
+    if problems:
+        # The report is still written — an operator wants to see how far it got.
+        for p in problems:
+            print(f"PROBLEM: {p}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_explain(args: argparse.Namespace) -> int:
     cfg = _build_config(args)
     store = _make_store(args)
@@ -266,6 +475,8 @@ def _common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--provider", default="yfinance", help="yfinance | stooq | tiingo")
     p.add_argument("--csv-dir", default=None, help="use a local directory of TICKER.csv files instead")
     p.add_argument("--cache-dir", default="data/cache")
+    p.add_argument("--repo", default=None, metavar="DIR",
+                   help="read/write the incremental price database at DIR (e.g. 'data')")
     p.add_argument("--offline", action="store_true", help="never hit the network; cache only")
     p.add_argument("--refresh", action="store_true", help="ignore the cache and refetch")
     p.add_argument("--out", default="out")
@@ -302,6 +513,32 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--trail-ma", type=int, default=20, choices=[10, 20])
     h.add_argument("--partial-days", type=int, default=4)
     h.set_defaults(func=cmd_history)
+
+    def _fetch_opts(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--workers", type=int, default=8, help="parallel fetches; lower it if rate-limited")
+        p.add_argument("--pause", type=float, default=0.0, help="seconds to wait before each fetch")
+        p.add_argument("--history-years", type=int, default=12, help="how far back to seed new symbols")
+        p.add_argument("--force", action="store_true", help="also retry symbols benched for repeated failures")
+
+    u = sub.add_parser("update", help="refresh the local price database (incremental)")
+    _common(u)
+    _fetch_opts(u)
+    u.add_argument("--universe", default="sample")
+    u.set_defaults(func=cmd_update)
+
+    d = sub.add_parser("daily", help="update + filter + charts + HTML report — schedule this one")
+    _common(d)
+    _fetch_opts(d)
+    d.add_argument("--universe", default="sample")
+    d.add_argument("--charts", type=int, default=25, metavar="N")
+    d.add_argument("--min-score", type=float, default=0.0)
+    d.add_argument("--state", choices=["setup", "breakout"], default=None)
+    d.add_argument("--skip-update", action="store_true", help="filter against the database as it stands")
+    d.add_argument("--max-failure-ratio", type=float, default=0.5,
+                   help="exit non-zero if more than this fraction of fetches fail (default 0.5)")
+    d.add_argument("--max-stale-days", type=int, default=5,
+                   help="exit non-zero if the newest bar is older than this (default 5)")
+    d.set_defaults(func=cmd_daily)
 
     e = sub.add_parser("explain", help="show every measured value for one symbol/date")
     _common(e)

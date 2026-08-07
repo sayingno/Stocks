@@ -5,8 +5,10 @@ venv/
 .env
 
 # scanner artifacts
-data/cache/
-data/demo/
+data/
 out/
+logs/
 *.png
 !docs/*.png
+.qscan.lock
+.qscan.lock.d/

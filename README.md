@@ -94,30 +94,62 @@ threshold is overridable from the command line.
 pip install -r requirements.txt
 ```
 
-## 4. Daily scan
+## 4. Run it every day automatically
+
+`daily` is the scheduled job: refresh the price database, apply the filters,
+render the charts, write an HTML report. **See [docs/AUTOMATION.md](docs/AUTOMATION.md)
+for the full setup** — this is the short version.
 
 ```bash
 # 1. get a real universe (needs network to nasdaqtrader.com)
 python -c "from qscan.universe import download_us_listings as d; \
            open('universes/us_all.txt','w').write('\n'.join(d()))"
 
-# 2. scan it
-python -m qscan scan --universe us_all --provider yfinance --charts 20
+# 2. seed the price database once — slow, interruptible, resumable
+python -m qscan update --universe us_all --repo data --workers 6 --verbose
+
+# 3. from then on, this is the whole daily job (a couple of minutes)
+python -m qscan daily --universe us_all --repo data --charts 25
 ```
 
-Output: `out/scan_<date>.csv` ranked by score, plus annotated PNGs of the top N
-in `out/charts/`. First run downloads and caches bars under `data/cache/`;
-re-runs the same day are free.
+Then schedule step 3 with one of:
 
-Useful variants:
+| Platform | How | File |
+|---|---|---|
+| Linux / WSL | cron → `30 17 * * 1-5 /path/Stocks/scripts/daily_scan.sh` | `scripts/daily_scan.sh` |
+| macOS | launchd (catches up after sleep; cron does not) | `scripts/com.qscan.daily.plist` |
+| No machine of your own | GitHub Actions, 22:00 UTC weekdays | `.github/workflows/daily-scan.yml` |
+| Windows | Task Scheduler | snippet in the automation doc |
+
+**Output** — `out/latest.html` is a single self-contained file (charts embedded
+as base64, nothing loaded from the network, adapts to light/dark) containing
+stat tiles, a table of every candidate with its full trade plan, and the
+annotated chart of each. Alongside it: `out/scan_<date>.csv` and
+`out/charts/<date>/*.png`.
+
+The refresh is genuinely incremental — the first build downloads years of
+history, every run after fetches only the new bars. It detects splits (a 2:1
+split rewrites adjusted history, so the symbol is re-downloaded rather than
+appended to), benches tickers that fail repeatedly, and writes atomically so an
+interrupted run can't corrupt anything.
+
+For automation, `daily` exits non-zero when more than half the fetches fail or
+the newest bar is more than 5 days old, so a broken feed reports as a failure
+rather than as a quiet "0 candidates". Zero candidates on healthy data is a
+success — that's a normal result in a corrective market.
+
+Tuning what comes back:
 
 ```bash
-python -m qscan scan --universe us_all --state breakout        # triggering today
-python -m qscan scan --universe us_all --state setup --min-score 70
-python -m qscan scan --universe us_all --preset strict         # ADR 5%+, $20M+, tight bases
-python -m qscan scan --universe us_all --account-size 250000 --risk-pct 0.0075
-python -m qscan scan --universe us_all --set max_base_depth=0.25 --set min_adr_pct=6
+python -m qscan daily --universe us_all --repo data --state breakout   # triggering today
+python -m qscan daily --universe us_all --repo data --preset strict    # ADR 5%+, $20M+
+python -m qscan daily --universe us_all --repo data --preset relaxed   # thin tape
+python -m qscan daily --universe us_all --repo data --account-size 250000 --risk-pct 0.0075
+python -m qscan daily --universe us_all --repo data --set max_base_depth=0.25 --min-score 65
 ```
+
+`scan` is the same filter without the refresh or the report — handy for
+one-off exploring against the ad-hoc cache.
 
 ## 5. Finding the past setups and their charts
 
@@ -168,8 +200,9 @@ Add `--offline` to work purely from cache.
 
 ```bash
 python tools/make_demo_data.py --out data/demo
-python -m qscan scan    --csv-dir data/demo --universe data/demo/universe.txt --offline
+python -m qscan daily   --csv-dir data/demo --repo data/db --universe data/demo/universe.txt --charts 5
 python -m qscan history --csv-dir data/demo --universe data/demo/universe.txt --offline --charts 6
+open out/latest.html
 ```
 
 Synthetic tickers with known shapes (`GOODBRK`, `FAILBRK`, `COILED`, `DEEPBASE`,
@@ -181,12 +214,20 @@ Synthetic tickers with known shapes (`GOODBRK`, `FAILBRK`, `COILED`, `DEEPBASE`,
 python -m unittest discover -s tests -t .
 ```
 
-34 tests over hand-built OHLCV series: the textbook setup must pass, a coiled
-base must classify as `setup` and not `breakout`, downtrends / deep bases /
-sub-50MA / illiquid names must be rejected at the named gate, the stop must
-never exceed 1 ADR, sizing must respect the risk budget and position cap, and
-the trade simulator must return ≈ −1R on a designed failure and multiple R on a
-designed winner.
+70 tests over hand-built OHLCV series, no network required:
+
+- **detector** — the textbook setup passes; a coiled base classifies as `setup`
+  not `breakout`; downtrends, deep bases, sub-50MA and illiquid names are
+  rejected at the named gate.
+- **risk** — the stop never exceeds 1 ADR; sizing respects the risk budget and
+  the position cap.
+- **outcomes** — the simulator returns ≈ −1R on a designed failure and multiple
+  R on a designed winner.
+- **database** — a second run is a no-op; new bars append without refetching
+  history; a simulated 2:1 split triggers a full re-download while rounding
+  noise does not; repeated failures bench a symbol and `--force` un-benches it.
+- **pipeline** — `daily` writes report, CSV and charts; a broken feed and stale
+  data each exit non-zero; zero candidates on healthy data exits zero.
 
 ## 10. Layout
 
@@ -196,10 +237,17 @@ qscan/
   indicators.py       MAs, ADR, ATR, dollar volume, slopes
   setup_breakout.py   the detector: gates, scoring, trade plan
   outcomes.py         forward returns + the trade simulator
+  repository.py       the incremental price database (splits, retries, benching)
   data.py             providers (yfinance/stooq/tiingo/csv) + disk cache
   universe.py         ticker lists
   charts.py           annotated candlestick renderer
-  cli.py              scan / history / explain
+  report.py           self-contained HTML digest
+  cli.py              update / daily / scan / history / explain
+scripts/
+  daily_scan.sh             cron & launchd wrapper: venv, logging, locking
+  com.qscan.daily.plist     macOS launchd job
+.github/workflows/daily-scan.yml
+docs/AUTOMATION.md
 tools/make_demo_data.py
 tests/
 ```

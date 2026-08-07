@@ -138,7 +138,11 @@ def plot_signal(
     ax.grid(color=GRID, linewidth=0.6)
     ax.legend(loc="upper left", fontsize=7, ncol=3, frameon=False)
     ax.set_ylabel("price", fontsize=9)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %y"))
+    # One tick per month (or every other/third for long windows) so the labels
+    # stay distinct instead of repeating "Apr 26  Apr 26".
+    months = max(1, len(view) // 21)
+    axv.xaxis.set_major_locator(mdates.MonthLocator(interval=max(1, months // 6)))
+    axv.xaxis.set_major_formatter(mdates.DateFormatter("%b %y"))
     fig.autofmt_xdate(rotation=0, ha="center")
 
     out = Path(out_path)
