@@ -33,7 +33,10 @@ class TradeRules:
     max_stop_adr_mult: float = 1.0
 
 
-def forward_returns(ann: pd.DataFrame, bar: int, horizons=(5, 10, 20, 60)) -> dict[str, Any]:
+def forward_returns(
+    ann: pd.DataFrame, bar: int, horizons=(5, 10, 20, 60), direction: int = 1
+) -> dict[str, Any]:
+    """Plain forward returns, signed so a short's favourable move is positive."""
     close = ann["close"].to_numpy(dtype=float)
     high = ann["high"].to_numpy(dtype=float)
     low = ann["low"].to_numpy(dtype=float)
@@ -42,11 +45,14 @@ def forward_returns(ann: pd.DataFrame, bar: int, horizons=(5, 10, 20, 60)) -> di
     out: dict[str, Any] = {}
     for h in horizons:
         j = bar + h
-        out[f"fwd_{h}d"] = (close[j] / base - 1.0) if j < n else float("nan")
+        out[f"fwd_{h}d"] = direction * (close[j] / base - 1.0) if j < n else float("nan")
     window = slice(bar + 1, min(n, bar + 21))
     if window.start < n:
-        out["mfe_20d"] = float(np.max(high[window])) / base - 1.0
-        out["mae_20d"] = float(np.min(low[window])) / base - 1.0
+        up = float(np.max(high[window])) / base - 1.0
+        down = float(np.min(low[window])) / base - 1.0
+        # Favourable excursion is up for a long, down for a short.
+        out["mfe_20d"] = up if direction > 0 else -down
+        out["mae_20d"] = down if direction > 0 else -up
     else:
         out["mfe_20d"] = out["mae_20d"] = float("nan")
     return out
@@ -68,22 +74,35 @@ def simulate_trade(
 
     bar = int(signal["bar"])
     entry_trigger = float(signal["entry"])
-    adr = float(signal["adr20"]) / 100.0
+    # A setup may supply its own stop-reference volatility (the episodic pivot
+    # does, because the gap resets the stock's range); otherwise use the ADR.
+    adr = float(signal.get("stop_adr_ref") or signal["adr20"]) / 100.0
+    direction = int(signal.get("direction", 1))
 
     # ---- find the fill ------------------------------------------------------
-    if signal.get("state") == "breakout":
+    # A long triggers when price trades up through the entry, a short when it
+    # trades down through it. States that fire on the signal bar itself
+    # ("breakout", "ep", "short") fill immediately.
+    if signal.get("state") in ("breakout", "ep", "short"):
         fill_bar, fill = bar, entry_trigger
     else:
         fill_bar, fill = None, None
         for j in range(bar + 1, min(n, bar + 1 + rules.trigger_window)):
-            if h[j] >= entry_trigger:
+            if direction > 0 and h[j] >= entry_trigger:
                 fill_bar, fill = j, max(entry_trigger, o[j])
+                break
+            if direction < 0 and lo[j] <= entry_trigger:
+                fill_bar, fill = j, min(entry_trigger, o[j])
                 break
         if fill_bar is None:
             return {"outcome": "no_trigger", "r_multiple": float("nan"), "days_held": 0}
 
-    stop = max(lo[fill_bar], fill * (1.0 - adr * rules.max_stop_adr_mult))
-    risk = fill - stop
+    if direction > 0:
+        stop = max(lo[fill_bar], fill * (1.0 - adr * rules.max_stop_adr_mult))
+        risk = fill - stop
+    else:
+        stop = min(h[fill_bar], fill * (1.0 + adr * rules.max_stop_adr_mult))
+        risk = stop - fill
     if risk <= 0:
         return {"outcome": "bad_risk", "r_multiple": float("nan"), "days_held": 0}
 
@@ -94,43 +113,52 @@ def simulate_trade(
     exit_reason = "max_hold"
     exit_bar = min(n - 1, fill_bar + rules.max_hold)
 
+    def r_of(px: float) -> float:
+        return direction * (px - fill) / risk
+
     for j in range(fill_bar + 1, min(n, fill_bar + 1 + rules.max_hold)):
-        mfe_r = max(mfe_r, (h[j] - fill) / risk)
-        mae_r = min(mae_r, (lo[j] - fill) / risk)
+        mfe_r = max(mfe_r, r_of(h[j] if direction > 0 else lo[j]))
+        mae_r = min(mae_r, r_of(lo[j] if direction > 0 else h[j]))
 
         # 1. stop first - a gap through it fills at the open
-        if lo[j] <= stop:
-            px = min(o[j], stop) if o[j] < stop else stop
-            realised_r += remaining * (px - fill) / risk
+        stopped = lo[j] <= stop if direction > 0 else h[j] >= stop
+        if stopped:
+            gapped = o[j] < stop if direction > 0 else o[j] > stop
+            px = o[j] if gapped else stop
+            realised_r += remaining * r_of(px)
             remaining, exit_reason, exit_bar = 0.0, ("stopped" if not took_partial else "trail_stop"), j
             break
 
-        # 2. sell into the first burst of strength
+        # 2. take the first burst in your favour
         if not took_partial:
-            hit_target = h[j] >= fill + rules.partial_at_r * risk
+            target = fill + direction * rules.partial_at_r * risk
+            hit_target = (h[j] >= target) if direction > 0 else (lo[j] <= target)
             hit_time = (j - fill_bar) >= rules.partial_days
             if hit_target or hit_time:
-                px = fill + rules.partial_at_r * risk if hit_target else c[j]
-                realised_r += rules.partial_fraction * (px - fill) / risk
+                px = target if hit_target else c[j]
+                realised_r += rules.partial_fraction * r_of(px)
                 remaining -= rules.partial_fraction
                 took_partial = True
                 if rules.breakeven_after_partial:
-                    stop = max(stop, fill)
+                    stop = min(stop, fill) if direction < 0 else max(stop, fill)
                 continue
 
         # 3. trail the rest on the moving average
-        if took_partial and np.isfinite(trail[j]) and c[j] < trail[j]:
-            realised_r += remaining * (c[j] - fill) / risk
-            remaining, exit_reason, exit_bar = 0.0, "ma_trail", j
-            break
+        if took_partial and np.isfinite(trail[j]):
+            broke = c[j] < trail[j] if direction > 0 else c[j] > trail[j]
+            if broke:
+                realised_r += remaining * r_of(c[j])
+                remaining, exit_reason, exit_bar = 0.0, "ma_trail", j
+                break
 
     if remaining > 0:  # ran out of data or hit max hold
         last = min(n - 1, fill_bar + rules.max_hold)
-        realised_r += remaining * (c[last] - fill) / risk
+        realised_r += remaining * r_of(c[last])
         exit_bar = last
 
     return {
         "outcome": exit_reason,
+        "direction": direction,
         "fill_date": ann.index[fill_bar],
         "fill": fill,
         "sim_stop": stop,

@@ -112,3 +112,123 @@ STRICT = BreakoutConfig(
 )
 
 PRESETS = {"default": DEFAULT, "relaxed": RELAXED, "strict": STRICT}
+
+
+# ---------------------------------------------------------------------------
+# Setup #2 — Episodic Pivot
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class EPConfig:
+    # tradability (dollar volume is measured on the 20 days *before* the gap)
+    min_price: float = 5.0
+    min_dollar_volume: float = 1_000_000.0
+    min_adr_pct: float = 3.0
+    max_adr_pct: float = 30.0
+
+    # the gap
+    min_gap: float = 0.10  # open vs prior close
+    min_volume_mult: float = 2.0  # vs the prior 20-day average
+
+    # dormancy — the part people skip, and the part that matters
+    dormancy_lookback: int = 126  # ~6 months before the gap
+    max_prior_gain: float = 0.50  # it must not already have run
+    max_dormant_band: float = 0.60  # high-to-low range of that stretch
+
+    # holding the gap
+    min_close_position: float = 0.50  # close in the upper half of the day
+    require_close_above_open: bool = True
+
+    ma_fast: int = 10
+    ma_mid: int = 20
+    ma_slow: int = 50
+    use_ema: bool = False
+
+    min_rs_rank: float | None = None
+    rs_weights: tuple[float, float, float] = (0.4, 0.3, 0.3)
+
+    max_stop_adr_mult: float = 1.0
+    account_size: float = 100_000.0
+    risk_pct: float = 0.005
+    max_position_pct: float = 0.20
+
+    def with_overrides(self, **kwargs: Any) -> "EPConfig":
+        unknown = set(kwargs) - set(asdict(self))
+        if unknown:
+            raise ValueError(f"unknown config fields: {sorted(unknown)}")
+        return replace(self, **kwargs)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+EP_DEFAULT = EPConfig()
+EP_RELAXED = EPConfig(
+    min_dollar_volume=300_000.0, min_adr_pct=2.5, min_gap=0.06, min_volume_mult=1.5,
+    max_prior_gain=1.00, max_dormant_band=0.80, min_close_position=0.35,
+    require_close_above_open=False,
+)
+EP_STRICT = EPConfig(
+    min_dollar_volume=10_000_000.0, min_adr_pct=4.0, min_gap=0.15, min_volume_mult=4.0,
+    max_prior_gain=0.25, max_dormant_band=0.45, min_close_position=0.65,
+)
+
+EP_PRESETS = {"default": EP_DEFAULT, "relaxed": EP_RELAXED, "strict": EP_STRICT}
+
+
+# ---------------------------------------------------------------------------
+# Setup #3 — Parabolic short
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ParabolicConfig:
+    min_price: float = 5.0
+    min_dollar_volume: float = 5_000_000.0
+    min_adr_pct: float = 5.0  # it has to move, or the short cannot pay
+    max_adr_pct: float = 60.0
+
+    # the run
+    run_lookback: int = 25
+    min_run_gain: float = 0.80  # low to high inside the lookback
+    max_run_bars: int = 25  # vertical, not a grind
+
+    min_extension: float = 0.30  # close vs the 20MA
+    min_volume_mult: float = 1.5  # run volume vs the prior 20-day average
+
+    # the crack
+    max_close_position: float = 0.40  # a reversal bar closes near its low
+    min_green_streak: int = 3  # for the red-after-green trigger
+    max_days_off_high: int = 3  # short the break, not the third day down
+
+    ma_fast: int = 10
+    ma_mid: int = 20
+    ma_slow: int = 50
+    use_ema: bool = False
+
+    min_rs_rank: float | None = None
+    rs_weights: tuple[float, float, float] = (0.4, 0.3, 0.3)
+
+    max_stop_adr_mult: float = 1.0
+    account_size: float = 100_000.0
+    risk_pct: float = 0.005
+    max_position_pct: float = 0.10  # half the long cap: losses are unbounded
+
+    def with_overrides(self, **kwargs: Any) -> "ParabolicConfig":
+        unknown = set(kwargs) - set(asdict(self))
+        if unknown:
+            raise ValueError(f"unknown config fields: {sorted(unknown)}")
+        return replace(self, **kwargs)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+PARA_DEFAULT = ParabolicConfig()
+PARA_RELAXED = ParabolicConfig(
+    min_dollar_volume=2_000_000.0, min_adr_pct=4.0, min_run_gain=0.50,
+    min_extension=0.20, max_close_position=0.55, max_days_off_high=5,
+)
+PARA_STRICT = ParabolicConfig(
+    min_dollar_volume=20_000_000.0, min_adr_pct=8.0, min_run_gain=1.50,
+    min_extension=0.50, max_close_position=0.30, max_days_off_high=2,
+)
+
+PARA_PRESETS = {"default": PARA_DEFAULT, "relaxed": PARA_RELAXED, "strict": PARA_STRICT}

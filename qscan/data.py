@@ -185,8 +185,11 @@ class PriceStore:
         return age < _STALE_AFTER
 
     def get(self, symbol: str, start: str, end: str, refresh: bool = False) -> pd.DataFrame:
+        # The memo holds the *full* series, never the sliced view: caching the
+        # slice under the bare symbol made a second call with a different window
+        # return the first call's range.
         if symbol in self._mem and not refresh:
-            return self._mem[symbol]
+            return self._mem[symbol].loc[str(start) : str(end)]
 
         cached = self._read_cache(symbol)
         use_cache = cached is not None and not refresh and (self.offline or self._cache_fresh(symbol))
@@ -202,9 +205,8 @@ class PriceStore:
                     raise
                 df = cached  # network hiccup: fall back to whatever we have
 
-        df = df.loc[str(start) : str(end)]
         self._mem[symbol] = df
-        return df
+        return df.loc[str(start) : str(end)]
 
     def get_many(
         self,

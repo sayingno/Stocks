@@ -122,12 +122,151 @@ def winner_after_signal(base: pd.DataFrame | None = None, run_pct: float = 0.55)
     return pd.concat([df, tail])
 
 
+def episodic_pivot(gap: float = 0.22, vol_mult: float = 8.0, dormant_bars: int = 200) -> pd.DataFrame:
+    """Months of going nowhere, then a big gap up on enormous volume."""
+    flat = 20.0 + np.sin(np.arange(dormant_bars) / 14.0) * 0.9
+    closes = np.concatenate([flat, [0.0]])
+    ranges = np.concatenate([np.full(dormant_bars, 0.028), [0.09]])
+    volumes = np.concatenate([np.full(dormant_bars, 1.0e6), [1.0e6 * vol_mult]])
+
+    df = build(closes[:-1], ranges[:-1], volumes[:-1])
+    prev_close = float(df["close"].iloc[-1])
+    open_px = prev_close * (1 + gap)
+    close_px = open_px * 1.04  # closes above the open, near the highs
+    idx = pd.bdate_range(df.index[-1] + pd.offsets.BDay(1), periods=1)
+    day = pd.DataFrame(
+        {
+            "open": [open_px],
+            "high": [close_px * 1.012],
+            "low": [open_px * 0.985],
+            "close": [close_px],
+            "volume": [1.0e6 * vol_mult],
+        },
+        index=idx,
+    )
+    return pd.concat([df, day])
+
+
+def ep_after_a_big_run() -> pd.DataFrame:
+    """A gap that arrives when the stock has *already* tripled — a blow-off, not an EP."""
+    n = 200  # must clear the EP warmup (dormancy_lookback + 25)
+    run = _ramp(20.0, 62.0, n)
+    df = build(run, np.full(n, 0.05), np.full(n, 2.0e6))
+    prev_close = float(df["close"].iloc[-1])
+    open_px = prev_close * 1.20
+    close_px = open_px * 1.03
+    idx = pd.bdate_range(df.index[-1] + pd.offsets.BDay(1), periods=1)
+    day = pd.DataFrame(
+        {"open": [open_px], "high": [close_px * 1.01], "low": [open_px * 0.98],
+         "close": [close_px], "volume": [1.6e7]},
+        index=idx,
+    )
+    return pd.concat([df, day])
+
+
+def parabolic_top(run_gain: float = 1.9, crack: bool = True) -> pd.DataFrame:
+    """A long quiet stretch, a vertical run, then a reversal bar off the high."""
+    quiet_n, run_n = 160, 16
+    quiet = 20.0 + np.sin(np.arange(quiet_n) / 11.0) * 0.5
+    top = 20.0 * (1 + run_gain)
+    run = _ramp(21.0, top, run_n)
+
+    closes = np.concatenate([quiet, run])
+    ranges = np.concatenate([np.full(quiet_n, 0.03), np.linspace(0.09, 0.16, run_n)])
+    volumes = np.concatenate([np.full(quiet_n, 1.0e6), np.linspace(4e6, 1.1e7, run_n)])
+    df = build(closes, ranges, volumes)
+
+    last = float(df["close"].iloc[-1])
+    idx = pd.bdate_range(df.index[-1] + pd.offsets.BDay(1), periods=1)
+    if crack:
+        # Opens higher, tags a marginal new high, then closes near the low.
+        high = last * 1.10
+        day = pd.DataFrame(
+            {"open": [last * 1.06], "high": [high], "low": [last * 0.88],
+             "close": [last * 0.90], "volume": [1.4e7]},
+            index=idx,
+        )
+    else:
+        # Still going straight up — must not signal.
+        day = pd.DataFrame(
+            {"open": [last * 1.02], "high": [last * 1.13], "low": [last * 1.01],
+             "close": [last * 1.12], "volume": [1.3e7]},
+            index=idx,
+        )
+    return pd.concat([df, day])
+
+
+def ep_cycles(cycles: int = 6, seed: int = 0, start_price: float = 22.0, start: str = "2015-01-02") -> pd.DataFrame:
+    """Long dormant stretches punctuated by genuine episodic pivots.
+
+    `multi_cycle` deliberately cannot produce these — its names turn over every
+    ~100 bars, so the six-month dormancy window always contains the previous
+    run. An EP needs a stock that really has gone nowhere.
+    """
+    rng = np.random.default_rng(seed)
+    closes: list[float] = []
+    ranges: list[float] = []
+    volumes: list[float] = []
+    gaps: list[tuple[int, float]] = []
+    price = start_price
+
+    for _ in range(cycles):
+        # Dormant: months of drifting sideways in a tight band.
+        n = int(rng.integers(150, 200))
+        drift = price * (1.0 + np.sin(np.arange(n) / 21.0) * 0.05 + rng.normal(0, 0.006, n).cumsum() * 0.25)
+        closes.extend(drift)
+        ranges.extend(np.full(n, 0.025))
+        volumes.extend(rng.uniform(0.8e6, 1.3e6, n))
+        price = float(drift[-1])
+
+        # The pivot: a gap, then a multi-week run as institutions build.
+        gaps.append((len(closes), float(rng.uniform(0.14, 0.32))))
+        n = int(rng.integers(25, 45))
+        run = _ramp(price * 1.05, price * (1 + float(rng.uniform(0.35, 1.10))), n)
+        closes.extend(run)
+        ranges.extend(np.full(n, 0.055))
+        volumes.extend(rng.uniform(2.5e6, 5e6, n))
+        price = float(run[-1])
+
+        # Settle into a new, higher range.
+        n = int(rng.integers(20, 40))
+        settle = _ramp(price, price * float(rng.uniform(0.80, 0.95)), n)
+        closes.extend(settle)
+        ranges.extend(np.full(n, 0.035))
+        volumes.extend(rng.uniform(1.0e6, 1.8e6, n))
+        price = float(settle[-1])
+
+    arr = np.asarray(closes, dtype=float)
+    noise = np.zeros(len(arr))
+    for i in range(1, len(arr)):
+        noise[i] = noise[i - 1] * 0.85 + rng.normal(0, 0.010)
+    df = build(arr * (1.0 + noise), ranges, volumes, start=start)
+
+    for pos, size in gaps:
+        if pos <= 0 or pos >= len(df):
+            continue
+        prev_close = float(df["close"].iloc[pos - 1])
+        open_px = prev_close * (1.0 + size)
+        scale = open_px / float(df["open"].iloc[pos])
+        idx = df.index[pos:]
+        for col in ("open", "high", "low", "close"):
+            df.loc[idx, col] = df.loc[idx, col] * scale
+        bar = df.index[pos]
+        df.loc[bar, "open"] = open_px
+        df.loc[bar, "close"] = max(float(df.loc[bar, "close"]), open_px * 1.03)
+        df.loc[bar, "high"] = max(float(df.loc[bar, "close"]) * 1.01, float(df.loc[bar, "high"]))
+        df.loc[bar, "low"] = min(open_px * 0.99, float(df.loc[bar, "low"]))
+        df.loc[bar, "volume"] = float(df.loc[bar, "volume"]) * 9.0
+    return df
+
+
 def multi_cycle(
     cycles: int = 12,
     seed: int = 0,
     start_price: float = 18.0,
     win_rate: float = 0.35,
     start: str = "2015-01-02",
+    gap_rate: float = 0.5,
 ) -> pd.DataFrame:
     """Years of bars containing repeated impulse → base → resolution cycles.
 
@@ -140,6 +279,8 @@ def multi_cycle(
     closes: list[float] = []
     ranges: list[float] = []
     volumes: list[float] = []
+    gap_at: list[int] = []
+    gap_size: list[float] = []
     price = start_price
 
     def push(seq, rng_seq, vol_seq):
@@ -154,9 +295,12 @@ def multi_cycle(
         push(drift, np.full(n, 0.025), rng.uniform(0.6e6, 1.1e6, n))
         price = float(drift[-1])
 
-        # impulse
+        # impulse — sometimes kicked off by an overnight gap (an episodic pivot)
         n = int(rng.integers(10, 20))
         gain = float(rng.uniform(0.45, 0.95))
+        if rng.random() < gap_rate:
+            gap_at.append(len(closes))
+            gap_size.append(float(rng.uniform(0.12, 0.30)))
         imp = _ramp(price, price * (1 + gain), n)
         push(imp, np.full(n, 0.075), rng.uniform(2.8e6, 4.2e6, n))
         price = float(imp[-1])
@@ -196,7 +340,27 @@ def multi_cycle(
     for i in range(1, len(arr)):
         noise[i] = noise[i - 1] * 0.86 + rng.normal(0, 0.017)
     arr = arr * (1.0 + noise)
-    return build(arr, ranges, volumes, start=start)
+    df = build(arr, ranges, volumes, start=start)
+
+    # Re-price the chosen bars as true overnight gaps. build() derives each open
+    # from the prior close, so a gap has to be stamped in afterwards; every
+    # later bar is shifted with it so the series stays continuous.
+    for pos, size in zip(gap_at, gap_size):
+        if pos <= 0 or pos >= len(df):
+            continue
+        prev_close = float(df["close"].iloc[pos - 1])
+        open_px = prev_close * (1.0 + size)
+        scale = open_px / float(df["open"].iloc[pos])
+        idx = df.index[pos:]
+        for col in ("open", "high", "low", "close"):
+            df.loc[idx, col] = df.loc[idx, col] * scale
+        bar = df.index[pos]
+        df.loc[bar, "open"] = open_px
+        df.loc[bar, "close"] = max(float(df.loc[bar, "close"]), open_px * 1.02)
+        df.loc[bar, "high"] = max(float(df.loc[bar, "close"]) * 1.01, float(df.loc[bar, "high"]))
+        df.loc[bar, "low"] = min(open_px * 0.99, float(df.loc[bar, "low"]))
+        df.loc[bar, "volume"] = float(df.loc[bar, "volume"]) * 6.0
+    return df
 
 
 def loser_after_signal(base: pd.DataFrame | None = None) -> pd.DataFrame:

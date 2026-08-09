@@ -38,6 +38,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--long-names", type=int, default=0, metavar="N",
                     help="also emit N multi-year symbols (LONG00…) for cutoff and backtest testing")
+    ap.add_argument("--ep-names", type=int, default=0, metavar="N",
+                    help="also emit N dormant-then-gap symbols (EPIC00…) for the episodic pivot")
     ap.add_argument("--long-start", default="2015-01-02")
     args = ap.parse_args()
 
@@ -51,10 +53,17 @@ def main() -> int:
             lambda i=i: synthetic.multi_cycle(cycles=14, seed=args.seed + i, start=args.long_start,
                                               start_price=float(12 + 6 * (i % 5)))
         )
+    # A few names that go dormant for months at a time, so the episodic-pivot
+    # detector has something to find. multi_cycle turns over too fast to qualify.
+    for i in range(args.ep_names):
+        builders[f"EPIC{i:02d}"] = (
+            lambda i=i: synthetic.ep_cycles(cycles=7, seed=args.seed + 100 + i, start=args.long_start,
+                                            start_price=float(15 + 7 * (i % 4)))
+        )
 
     for name, builder in builders.items():
         df = builder().copy()
-        if not name.startswith("LONG"):
+        if not name.startswith(("LONG", "EPIC")):
             # Anchor short fixtures to today so the default scan window covers them.
             df.index = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=len(df))
         # A touch of noise so every file is not pathologically smooth.

@@ -26,7 +26,7 @@ from .config import PRESETS, BreakoutConfig
 from .data import DataError, PriceStore, default_window
 from .indicators import annotate
 from .outcomes import TradeRules, forward_returns, simulate_trade, summarise
-from . import portfolio, strength
+from . import portfolio, setups, strength
 from .portfolio import PortfolioConfig
 from .report import build_report
 from .repository import PriceRepository
@@ -55,14 +55,26 @@ HISTORY_COLUMNS = SCAN_COLUMNS + [
 
 
 # --------------------------------------------------------------------------
-def _build_config(args: argparse.Namespace) -> BreakoutConfig:
-    cfg = PRESETS[args.preset]
+def _setup(args: argparse.Namespace):
+    return setups.get(getattr(args, "setup", "breakout"))
+
+
+def _build_config(args: argparse.Namespace):
+    """Resolve the preset for the chosen setup, then apply CLI overrides.
+
+    Overrides are filtered to fields the chosen setup actually has, so
+    --min-adr-pct works everywhere while --max-base-depth only binds on the
+    breakout rather than erroring on the others.
+    """
+    setup = _setup(args)
+    cfg = setup.config(args.preset)
+    valid = set(cfg.to_dict())
     overrides: dict[str, Any] = {}
     for field in ("min_price", "min_dollar_volume", "min_adr_pct", "max_base_depth",
                   "min_base_len", "max_base_len", "max_dist_from_pivot",
                   "account_size", "risk_pct", "max_position_pct", "min_rs_rank"):
         value = getattr(args, field, None)
-        if value is not None:
+        if value is not None and field in valid:
             overrides[field] = value
     if getattr(args, "set", None):
         for pair in args.set:
@@ -136,6 +148,7 @@ def _print_table(df: pd.DataFrame, cols: list[str], limit: int) -> None:
 
 # --------------------------------------------------------------------------
 def cmd_scan(args: argparse.Namespace) -> int:
+    setup = _setup(args)
     cfg = _build_config(args)
     store = _make_store(args)
     symbols = universe_mod.load(args.universe)
@@ -172,7 +185,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         cfg = cfg.with_overrides(min_rs_rank=None)
 
     for sym, ann in frames.items():
-        rows.extend(scan_frame(ann, cfg, symbol=sym, rs_value=ranks.get(sym)))
+        rows.extend(setups.scan_frame(ann, setup, cfg, symbol=sym, rs_value=ranks.get(sym)))
 
     if not rows:
         print("no candidates today.", file=sys.stderr)
@@ -213,6 +226,7 @@ def _sweep_history(args: argparse.Namespace, cfg: BreakoutConfig):
 
     Returns (signals, annotated_frames, window).
     """
+    setup = _setup(args)
     store = _make_store(args)
     symbols = universe_mod.load(args.universe)
     start, end = _history_window(args)
@@ -221,7 +235,7 @@ def _sweep_history(args: argparse.Namespace, cfg: BreakoutConfig):
     # bar, so load earlier than the cutoff and only emit signals on or after it.
     load_start = (pd.Timestamp(start) - pd.Timedelta(days=400)).date().isoformat()
 
-    print(f"sweeping {len(symbols)} symbols {start} → {end} via {store.name} …", file=sys.stderr)
+    print(f"sweeping {len(symbols)} symbols for {setup.label} {start} → {end} via {store.name} …", file=sys.stderr)
 
     # ---- pass 1: load and annotate -----------------------------------------
     frames: dict[str, pd.DataFrame] = {}
@@ -251,26 +265,24 @@ def _sweep_history(args: argparse.Namespace, cfg: BreakoutConfig):
 
     # ---- pass 3: detect ------------------------------------------------------
     cutoff = pd.Timestamp(start)
-    warmup = max(cfg.ma_slow, 126, cfg.max_base_len + 5)
+    warmup = max(cfg.ma_slow, 126, getattr(cfg, "max_base_len", 0) + 5,
+                 getattr(cfg, "dormancy_lookback", 0) + 25,
+                 getattr(cfg, "run_lookback", 0) + 25)
     all_rows: list[dict[str, Any]] = []
     kept: dict[str, pd.DataFrame] = {}
 
     for n, (sym, ann) in enumerate(frames.items(), 1):
         if args.verbose and n % 200 == 0:
             print(f"  scanning {n}/{len(frames)} ({len(all_rows)} signals)", file=sys.stderr)
-        a = _Arrays.from_frame(ann)
-        rs = rs_arr(ann, strength.series_for(rs_panel, sym)) if not rs_panel.empty else None
+        rs_series = strength.series_for(rs_panel, sym) if not rs_panel.empty else None
         first = max(warmup, int(ann.index.searchsorted(cutoff)))
-        hits = []
-        for i in range(first, len(a)):
-            res = evaluate_bar(a, i, cfg, rs=rs)
-            if res["passed"]:
-                res["symbol"] = sym
-                res["bar"] = i
-                hits.append(res)
-        hits = dedupe_signals(hits, cooldown=args.cooldown)
+        hits = setups.scan_frame(
+            ann, setup, cfg, symbol=sym, positions=range(first, len(ann)), rs_series=rs_series
+        )
+        cooldown = args.cooldown if args.cooldown is not None else setup.cooldown
+        hits = dedupe_signals(hits, cooldown=cooldown)
         for hit in hits:
-            hit.update(forward_returns(ann, hit["bar"]))
+            hit.update(forward_returns(ann, hit["bar"], direction=setup.direction))
             hit.update(simulate_trade(ann, hit, rules))
         all_rows.extend(hits)
         if hits:
@@ -428,6 +440,7 @@ def cmd_update(args: argparse.Namespace) -> int:
 def cmd_daily(args: argparse.Namespace) -> int:
     """The scheduled job: refresh data, apply the filters, render charts, write a report."""
     started = datetime.now()
+    setup = _setup(args)
     cfg = _build_config(args)
     repo_root = args.repo or "data"
     repo = PriceRepository(
@@ -505,7 +518,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
         cfg = cfg.with_overrides(min_rs_rank=None)
 
     for sym, ann in frames.items():
-        hits = scan_frame(ann, cfg, symbol=sym, rs_value=ranks.get(sym))
+        hits = setups.scan_frame(ann, setup, cfg, symbol=sym, rs_value=ranks.get(sym))
         if hits:
             rows.extend(hits)
 
@@ -585,11 +598,27 @@ def cmd_daily(args: argparse.Namespace) -> int:
 
 
 def cmd_explain(args: argparse.Namespace) -> int:
+    setup = _setup(args)
     cfg = _build_config(args)
     store = _make_store(args)
     start, end = default_window(years=args.years)
     df = store.get(args.symbol, start, end, refresh=args.refresh)
+
+    if df.empty:
+        # Almost always a window/data mismatch rather than a missing symbol, so
+        # say which it is instead of dying on an index error further down.
+        full = store.get(args.symbol, "1900-01-01", "2100-01-01")
+        if full.empty:
+            raise DataError(f"{args.symbol}: no data at all from {store.name}")
+        raise DataError(
+            f"{args.symbol}: no bars between {start} and {end}; "
+            f"available range is {full.index[0].date()} to {full.index[-1].date()} "
+            f"(widen with --years, or pass --date inside that range)"
+        )
+
     ann = annotate(df, cfg)
+    if len(ann) == 0:
+        raise DataError(f"{args.symbol}: {len(df)} raw bars but none usable after cleaning")
     a = _Arrays.from_frame(ann)
 
     if args.date:
@@ -599,11 +628,11 @@ def cmd_explain(args: argparse.Namespace) -> int:
     else:
         i = len(ann) - 1
 
-    res = evaluate_bar(a, i, cfg)
+    res = setup.evaluate(a, i, cfg, rs=None)
     res["symbol"] = args.symbol
     res["bar"] = i
     verdict = "PASS" if res["passed"] else f"FAIL at gate: {res['reject']}"
-    print(f"\n{args.symbol} @ {ann.index[i].date()} -> {verdict}\n")
+    print(f"\n{args.symbol} @ {ann.index[i].date()} [{setup.label}] -> {verdict}\n")
     for key, value in res.items():
         if key in ("passed", "reject", "bar"):
             continue
@@ -622,7 +651,12 @@ def cmd_explain(args: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------
 def _common(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--preset", choices=sorted(PRESETS), default="default")
+    # argparse runs help through %-formatting, so any literal % must be doubled.
+    p.add_argument("--setup", choices=list(setups.NAMES), default="breakout",
+                   help="; ".join(
+                       f"{n}: {setups.REGISTRY[n].blurb}".replace("%", "%%") for n in setups.NAMES
+                   ))
+    p.add_argument("--preset", choices=["default", "relaxed", "strict"], default="default")
     p.add_argument("--provider", default="yfinance", help="yfinance | stooq | tiingo")
     p.add_argument("--csv-dir", default=None, help="use a local directory of TICKER.csv files instead")
     p.add_argument("--cache-dir", default="data/cache")
@@ -662,7 +696,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="only emit signals on or after this date (e.g. 2018-01-01)")
         p.add_argument("--end", default=None, metavar="YYYY-MM-DD")
         p.add_argument("--years", type=int, default=5, help="used only when --start is omitted")
-        p.add_argument("--cooldown", type=int, default=10, help="bars before the same name can re-signal")
+        p.add_argument("--cooldown", type=int, default=None,
+                       help="bars before the same name can re-signal (default: per-setup)")
         p.add_argument("--trail-ma", type=int, default=20, choices=[10, 20])
         p.add_argument("--partial-days", type=int, default=4)
 

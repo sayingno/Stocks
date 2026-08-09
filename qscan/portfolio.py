@@ -50,9 +50,12 @@ class _Open:
     risk_dollars: float
     r_multiple: float
     score: float
+    direction: int = 1
+    setup: str = ""
 
     @property
     def cost(self) -> float:
+        # A short still consumes buying power, so exposure is the absolute notional.
         return self.shares * self.fill
 
     @property
@@ -102,6 +105,8 @@ def run(signals: list[dict[str, Any]], cfg: PortfolioConfig = PortfolioConfig())
                 "r_multiple": float(r),
                 "score": float(s.get("score", 0.0)),
                 "stop": float(s.get("stop", 0.0)),
+                "direction": int(s.get("direction", 1)),
+                "setup": s.get("setup", ""),
                 "outcome": s.get("outcome", ""),
             }
         )
@@ -132,6 +137,8 @@ def run(signals: list[dict[str, Any]], cfg: PortfolioConfig = PortfolioConfig())
                 closed.append(
                     {
                         "symbol": pos.symbol,
+                        "setup": pos.setup,
+                        "direction": pos.direction,
                         "fill_date": pos.fill_date,
                         "exit_date": pos.exit_date,
                         "days_held": int(np.busday_count(pos.fill_date.date(), pos.exit_date.date())),
@@ -162,10 +169,10 @@ def run(signals: list[dict[str, Any]], cfg: PortfolioConfig = PortfolioConfig())
                 continue
 
             risk_dollars = equity * cfg.risk_pct
-            stop = cand["stop"]
-            risk_ps = cand["fill"] - stop
+            # Risk per share is entry-to-stop, whichever side the stop sits on.
+            risk_ps = abs(cand["fill"] - cand["stop"])
             if risk_ps <= 0:
-                # Fall back to the ADR-implied risk if the stored stop is unusable.
+                # Fall back to an ADR-ish distance if the stored stop is unusable.
                 risk_ps = cand["fill"] * 0.05
 
             shares = risk_dollars / risk_ps
@@ -186,6 +193,8 @@ def run(signals: list[dict[str, Any]], cfg: PortfolioConfig = PortfolioConfig())
                     risk_dollars=shares * risk_ps,
                     r_multiple=cand["r_multiple"],
                     score=cand["score"],
+                    direction=cand["direction"],
+                    setup=cand["setup"],
                 )
             )
 
@@ -206,6 +215,8 @@ def run(signals: list[dict[str, Any]], cfg: PortfolioConfig = PortfolioConfig())
         closed.append(
             {
                 "symbol": pos.symbol,
+                "setup": pos.setup,
+                "direction": pos.direction,
                 "fill_date": pos.fill_date,
                 "exit_date": pos.exit_date,
                 "days_held": int(np.busday_count(pos.fill_date.date(), pos.exit_date.date())),

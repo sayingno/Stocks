@@ -174,6 +174,39 @@ class TestFailureHandling(RepoTestCase):
         self.assertFalse(self.repo._should_skip("BAD", date.today()))
 
 
+class TestPriceStoreWindowing(unittest.TestCase):
+    """Regression: the in-memory memo must not be keyed by symbol alone."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        df = textbook_breakout()
+        df.index.name = "date"
+        df.to_csv(self.tmp / "TEST.csv")
+        self.frame = df
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_second_call_with_a_wider_window_is_not_served_the_first_slice(self):
+        from qscan.data import PriceStore
+
+        store = PriceStore(csv_dir=self.tmp, cache_dir=self.tmp / "cache")
+        mid = self.frame.index[len(self.frame) // 2]
+
+        narrow = store.get("TEST", str(mid.date()), "2100-01-01")
+        wide = store.get("TEST", "1900-01-01", "2100-01-01")
+
+        self.assertLess(len(narrow), len(self.frame))
+        self.assertEqual(len(wide), len(self.frame), "memo returned the earlier narrow slice")
+
+    def test_disjoint_window_returns_empty_not_stale_rows(self):
+        from qscan.data import PriceStore
+
+        store = PriceStore(csv_dir=self.tmp, cache_dir=self.tmp / "cache")
+        store.get("TEST", "1900-01-01", "2100-01-01")
+        self.assertTrue(store.get("TEST", "2099-01-01", "2099-12-31").empty)
+
+
 class TestParallelAndCoverage(RepoTestCase):
     def test_many_symbols_update_in_parallel(self):
         symbols = [f"SYM{i}" for i in range(12)]

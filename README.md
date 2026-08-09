@@ -1,10 +1,43 @@
-# qscan — a scanner for Qullamaggie's setup #1 (the Breakout)
+# qscan — a scanner for Qullamaggie's three setups
 
 Kristjan Kullamägi ("Qullamaggie") describes three setups in
 [*3 TIMELESS setups that have made me TENS OF MILLIONS*](https://qullamaggie.com/my-3-timeless-setups-that-have-made-me-tens-of-millions/).
-This repo implements the **first** one — the Breakout, also called the
-continuation or flag breakout — as a scanner you can run daily, and as a
-historical sweep that finds every past instance and draws the chart.
+This repo implements **all three** as a daily scanner, a historical sweep that
+finds every past instance and draws the chart, and a portfolio backtest.
+
+| `--setup` | What it looks for | Side |
+|---|---|---|
+| `breakout` | big prior move, then an orderly tightening base on the MAs, now pressing the pivot | long |
+| `ep` | dead for months, then gaps 10%+ out of the base on huge volume | long |
+| `parabolic` | vertical run, miles above the 20MA, first real crack | **short** |
+
+Every command takes `--setup`; it defaults to `breakout`.
+
+```bash
+python -m qscan daily    --setup ep        --universe us_all --repo data
+python -m qscan history  --setup parabolic --universe us_all --start 2018-01-01
+python -m qscan backtest --setup ep        --universe us_all --start 2018-01-01
+```
+
+### How #2 and #3 differ from #1
+
+The episodic pivot inverts two of the breakout's gates, which is the point:
+
+| | breakout | episodic pivot |
+|---|---|---|
+| prior move | +30–100% required | must have gone **nowhere** |
+| volume in the base | must dry **up** | must **explode** on the day |
+| trigger | clears a pivot | gaps clean out of a base |
+
+The dormancy rule is the one people skip and the one that matters — a 12% gap in
+something already up 200% this quarter is a blow-off, not an episodic pivot.
+
+The parabolic short is the mirror: entry on the break of the day's low, stop
+*above* the day's high capped at 1 ADR, and it refuses to fire until the day
+itself shows the crack (a reversal off the highs, a close below the prior low,
+or a red day ending a green streak). Its default position cap is half the long
+setups' — a long can only go to zero, a short cannot. The scanner also cannot
+see borrow availability or cost, so a signal there is not the same as a fill.
 
 ---
 
