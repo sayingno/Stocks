@@ -76,6 +76,10 @@ first failure is recorded, so a name that doesn't show up can tell you why.
 | `mid_ma_not_rising` | 20MA slope | > 0 |
 | `not_surfing_ma` | mean `|close − MA| / close` over the base, best of 10/20/50 | ≤ 12% |
 | `far_from_pivot` | `(pivot − close) / pivot` | ≤ 10% |
+| `weak_rs` | cross-sectional 1m/3m/6m strength percentile | off by default; `strict` uses 90 |
+
+The moving averages are **simple** by default. Qullamaggie's charts use SMAs, but
+if you want exponential: `--set use_ema=true` switches all three.
 
 Survivors are labelled **`breakout`** (cleared the pivot today on volume) or
 **`setup`** (coiled and within striking distance), scored 0–100 on a weighted
@@ -153,28 +157,78 @@ one-off exploring against the ad-hoc cache.
 
 ## 5. Finding the past setups and their charts
 
-This is the historical sweep. It walks every bar of every symbol, finds each
-distinct setup, simulates the trade under Qullamaggie's management rules, and
-renders the charts.
+The historical sweep walks every bar of every symbol from a cutoff date, finds
+each distinct setup, simulates the trade under Qullamaggie's management rules,
+and renders the charts.
 
 ```bash
-python -m qscan history --universe us_all --years 8 --charts 60 --contact-sheet
+python -m qscan history --universe us_all --start 2018-01-01 \
+       --min-rs-rank 80 --charts 60 --contact-sheet
 ```
+
+`--start` / `--end` take a date; `--years N` is the fallback when you don't.
+Bars before the cutoff are still *loaded* (indicators need ~6 months of run-up)
+but no signal is emitted before it.
 
 You get:
 
-- `out/history_8y.csv` — one row per setup with every measured feature, the
-  trade plan, forward returns at 5/10/20/60 days, MFE/MAE, and the simulated
-  R multiple and exit reason.
+- `out/history_<start>_<end>.csv` — one row per setup with every measured
+  feature, the trade plan, forward returns at 5/10/20/60 days, MFE/MAE, and the
+  simulated R multiple and exit reason.
 - `out/history_stats.json` — win rate, average R, expectancy, total R.
 - `out/charts/*.png` — the annotated chart of each setup: candles, 10/20/50 MAs,
   the consolidation shaded in, the pivot line, entry and stop, and the fill/exit
   markers showing what happened next.
 - `out/contact_sheet.png` — all of them on one page, for pattern-soaking.
 
-Sorting `history_*.csv` by `r_multiple` descending gives you the big winners;
-filtering on `outcome == "stopped"` gives you the failures, which are the more
-instructive study.
+Sorting by `r_multiple` descending gives you the big winners; filtering on
+`outcome == "stopped"` gives you the failures, which are the more instructive
+study.
+
+## 5b. Relative strength
+
+The prior-move gate is absolute — "+30% in a month". In a tape where everything
+is up 30%, that stops discriminating. `--min-rs-rank` adds the other question:
+*did it move more than everything else on that date?*
+
+Each symbol is ranked against the universe on its 1-, 3- and 6-month returns
+separately; the three percentiles are weighted 0.4 / 0.3 / 0.3 and re-ranked
+into a single 0–100 score. `--min-rs-rank 90` keeps only the top decile.
+
+Ranking happens per date, so a name that listed mid-sample joins the ranking
+when it appears — no lookahead. A symbol with no data on a date ranks `NaN` and
+is rejected at the `weak_rs` gate rather than being treated as weakest.
+
+The `strict` preset ships with `min_rs_rank=90`. It's off in `default` and
+`relaxed`, where the column is still computed and reported, just not filtered on.
+
+## 5c. Backtesting the whole thing
+
+`history` reports per-trade R, which is the right unit for judging the *setup* —
+but it assumes infinite capital and takes every signal. `backtest` replays the
+same signals as one account:
+
+```bash
+python -m qscan backtest --universe us_all --start 2018-01-01 \
+       --starting-equity 100000 --risk-pct 0.005 --max-positions 10 --charts 20
+```
+
+Constraints that per-trade R can't express:
+
+- **Concurrency** — at most `--max-positions` open at once. When more fire than
+  there are slots the highest-scoring win; the rest are counted in
+  `skipped_no_slot`, which is itself a diagnostic.
+- **Compounding** — risk is a percentage of *current* equity.
+- **Exposure** — `--max-exposure-pct` caps total capital deployed.
+
+Outputs: `backtest_trades_*.csv` (every fill with shares, dollars risked, P&L,
+running equity), `backtest_equity_*.csv` (the curve with drawdown),
+`backtest_stats.json` (CAGR, max drawdown, profit factor, win rate, average
+win/loss in R, average concurrent positions), and `equity_*.png` — the equity
+curve over a drawdown panel.
+
+Charts render only for trades the portfolio actually **took**, so what you study
+matches what you'd have held.
 
 ## 6. Diagnosing one name
 
@@ -214,7 +268,7 @@ Synthetic tickers with known shapes (`GOODBRK`, `FAILBRK`, `COILED`, `DEEPBASE`,
 python -m unittest discover -s tests -t .
 ```
 
-70 tests over hand-built OHLCV series, no network required:
+102 tests over hand-built OHLCV series, no network required:
 
 - **detector** — the textbook setup passes; a coiled base classifies as `setup`
   not `breakout`; downtrends, deep bases, sub-50MA and illiquid names are
@@ -228,6 +282,13 @@ python -m unittest discover -s tests -t .
   noise does not; repeated failures bench a symbol and `--force` un-benches it.
 - **pipeline** — `daily` writes report, CSV and charts; a broken feed and stale
   data each exit non-zero; zero candidates on healthy data exits zero.
+- **relative strength** — leaders outrank laggards; ranking is per-date, not
+  global; a symbol missing one horizon is scored on the others rather than
+  penalised; the gate rejects both weak and absent RS rather than passing
+  silently.
+- **portfolio** — the position cap skips the lower scores and frees up after an
+  exit; risk compounds with equity; exposure caps block extra names; a +2R
+  winner on 1% risk credits exactly the expected dollars.
 
 ## 10. Layout
 
@@ -237,12 +298,14 @@ qscan/
   indicators.py       MAs, ADR, ATR, dollar volume, slopes
   setup_breakout.py   the detector: gates, scoring, trade plan
   outcomes.py         forward returns + the trade simulator
+  strength.py         cross-sectional relative strength ranking
+  portfolio.py        portfolio backtest: capital, concurrency, equity curve
   repository.py       the incremental price database (splits, retries, benching)
   data.py             providers (yfinance/stooq/tiingo/csv) + disk cache
   universe.py         ticker lists
   charts.py           annotated candlestick renderer
   report.py           self-contained HTML digest
-  cli.py              update / daily / scan / history / explain
+  cli.py              update / daily / scan / history / backtest / explain
 scripts/
   daily_scan.sh             cron & launchd wrapper: venv, logging, locking
   com.qscan.daily.plist     macOS launchd job

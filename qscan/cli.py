@@ -26,15 +26,24 @@ from .config import PRESETS, BreakoutConfig
 from .data import DataError, PriceStore, default_window
 from .indicators import annotate
 from .outcomes import TradeRules, forward_returns, simulate_trade, summarise
+from . import portfolio, strength
+from .portfolio import PortfolioConfig
 from .report import build_report
 from .repository import PriceRepository
-from .setup_breakout import _Arrays, dedupe_signals, evaluate_bar, scan_symbol
+from .setup_breakout import (
+    _Arrays,
+    dedupe_signals,
+    evaluate_bar,
+    rs_array as rs_arr,
+    scan_frame,
+    scan_symbol,
+)
 
 SCAN_COLUMNS = [
     "date", "symbol", "state", "score", "close", "pivot", "dist_from_pivot",
     "entry", "stop", "risk_pct", "risk_in_adr", "shares", "position_value",
     "target_2r", "target_3r", "adr20", "dollar_vol20", "impulse_gain",
-    "ret_21d", "ret_63d", "ret_126d", "rs_63d_rank", "base_len", "base_depth",
+    "ret_21d", "ret_63d", "ret_126d", "rs_rank", "base_len", "base_depth",
     "contraction", "vol_dryup", "surf_ma", "surf_dist", "pivot_date",
 ]
 
@@ -51,7 +60,7 @@ def _build_config(args: argparse.Namespace) -> BreakoutConfig:
     overrides: dict[str, Any] = {}
     for field in ("min_price", "min_dollar_volume", "min_adr_pct", "max_base_depth",
                   "min_base_len", "max_base_len", "max_dist_from_pivot",
-                  "account_size", "risk_pct", "max_position_pct"):
+                  "account_size", "risk_pct", "max_position_pct", "min_rs_rank"):
         value = getattr(args, field, None)
         if value is not None:
             overrides[field] = value
@@ -102,6 +111,15 @@ def _make_store(args: argparse.Namespace) -> _Source:
     return _Source(args)
 
 
+def _history_window(args: argparse.Namespace) -> tuple[str, str]:
+    """Resolve --start/--end, falling back to --years back from today."""
+    end = args.end or date.today().isoformat()
+    if args.start:
+        return args.start, end
+    start, _ = default_window(years=args.years)
+    return pd.Timestamp(end).date().replace(year=pd.Timestamp(end).year - args.years).isoformat(), end
+
+
 def _write(df: pd.DataFrame, path: Path, columns: list[str]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     cols = [c for c in columns if c in df.columns]
@@ -127,7 +145,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     failures: list[tuple[str, str]] = []
     rows: list[dict[str, Any]] = []
-    rs_input: dict[str, float] = {}
+    frames: dict[str, pd.DataFrame] = {}
+    latest_returns: dict[str, tuple[float, float, float]] = {}
 
     print(f"scanning {len(symbols)} symbols via {store.name} …", file=sys.stderr)
     for n, sym in enumerate(symbols, 1):
@@ -141,10 +160,19 @@ def cmd_scan(args: argparse.Namespace) -> int:
         if len(df) < 140:
             continue
         ann = annotate(df, cfg)
-        if "ret_3m" in ann and pd.notna(ann["ret_3m"].iloc[-1]):
-            rs_input[sym] = float(ann["ret_3m"].iloc[-1])
-        hits = scan_symbol(df, cfg, symbol=sym, keep_rejects=False)
-        rows.extend(hits)
+        frames[sym] = ann
+        row = ann.iloc[-1]
+        latest_returns[sym] = tuple(
+            float(row[c]) if pd.notna(row[c]) else float("nan") for c in ("ret_1m", "ret_3m", "ret_6m")
+        )
+
+    ranks = strength.latest_ranks(latest_returns, cfg.rs_weights)
+    if cfg.min_rs_rank is not None and not ranks:
+        print("(universe too small to rank; RS gate disabled)", file=sys.stderr)
+        cfg = cfg.with_overrides(min_rs_rank=None)
+
+    for sym, ann in frames.items():
+        rows.extend(scan_frame(ann, cfg, symbol=sym, rs_value=ranks.get(sym)))
 
     if not rows:
         print("no candidates today.", file=sys.stderr)
@@ -153,9 +181,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
         return 0
 
     out = pd.DataFrame(rows)
-    if rs_input:
-        ranks = pd.Series(rs_input).rank(pct=True) * 100
-        out["rs_63d_rank"] = out["symbol"].map(ranks).round(1)
+    if ranks:
+        out["rs_rank"] = out["symbol"].map(ranks).round(1)
     out = out.sort_values("score", ascending=False).reset_index(drop=True)
     if args.state:
         out = out[out["state"] == args.state]
@@ -181,32 +208,62 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_history(args: argparse.Namespace) -> int:
-    cfg = _build_config(args)
+def _sweep_history(args: argparse.Namespace, cfg: BreakoutConfig):
+    """Find every historical setup in the universe. Shared by history and backtest.
+
+    Returns (signals, annotated_frames, window).
+    """
     store = _make_store(args)
     symbols = universe_mod.load(args.universe)
-    start, end = default_window(years=args.years)
+    start, end = _history_window(args)
     rules = TradeRules(trail_ma=args.trail_ma, partial_days=args.partial_days)
+    # Indicators need roughly six months of run-up before the first testable
+    # bar, so load earlier than the cutoff and only emit signals on or after it.
+    load_start = (pd.Timestamp(start) - pd.Timedelta(days=400)).date().isoformat()
 
-    all_rows: list[dict[str, Any]] = []
+    print(f"sweeping {len(symbols)} symbols {start} → {end} via {store.name} …", file=sys.stderr)
+
+    # ---- pass 1: load and annotate -----------------------------------------
     frames: dict[str, pd.DataFrame] = {}
-    print(f"sweeping {len(symbols)} symbols over ~{args.years}y via {store.name} …", file=sys.stderr)
-
     for n, sym in enumerate(symbols, 1):
-        if args.verbose and n % 50 == 0:
-            print(f"  {n}/{len(symbols)} ({len(all_rows)} signals)", file=sys.stderr)
+        if args.verbose and n % 200 == 0:
+            print(f"  loading {n}/{len(symbols)}", file=sys.stderr)
         try:
-            df = store.get(sym, start, end, refresh=args.refresh)
+            df = store.get(sym, load_start, end, refresh=args.refresh)
         except Exception:
             continue
         if len(df) < 200:
             continue
-        ann = annotate(df, cfg)
+        frames[sym] = annotate(df, cfg)
+
+    if not frames:
+        return [], {}, (start, end)
+
+    # ---- pass 2: cross-sectional relative strength --------------------------
+    rs_panel = pd.DataFrame()
+    if cfg.min_rs_rank is not None:
+        rs_panel = strength.build_panel(frames, cfg.rs_weights)
+        if rs_panel.empty:
+            print("  (universe too small to rank; RS gate disabled)", file=sys.stderr)
+            cfg = cfg.with_overrides(min_rs_rank=None)
+        elif args.verbose:
+            print(f"  ranked {rs_panel.shape[1]} symbols over {rs_panel.shape[0]} dates", file=sys.stderr)
+
+    # ---- pass 3: detect ------------------------------------------------------
+    cutoff = pd.Timestamp(start)
+    warmup = max(cfg.ma_slow, 126, cfg.max_base_len + 5)
+    all_rows: list[dict[str, Any]] = []
+    kept: dict[str, pd.DataFrame] = {}
+
+    for n, (sym, ann) in enumerate(frames.items(), 1):
+        if args.verbose and n % 200 == 0:
+            print(f"  scanning {n}/{len(frames)} ({len(all_rows)} signals)", file=sys.stderr)
         a = _Arrays.from_frame(ann)
-        warmup = max(cfg.ma_slow, 126, cfg.max_base_len + 5)
+        rs = rs_arr(ann, strength.series_for(rs_panel, sym)) if not rs_panel.empty else None
+        first = max(warmup, int(ann.index.searchsorted(cutoff)))
         hits = []
-        for i in range(warmup, len(a)):
-            res = evaluate_bar(a, i, cfg)
+        for i in range(first, len(a)):
+            res = evaluate_bar(a, i, cfg, rs=rs)
             if res["passed"]:
                 res["symbol"] = sym
                 res["bar"] = i
@@ -217,7 +274,14 @@ def cmd_history(args: argparse.Namespace) -> int:
             hit.update(simulate_trade(ann, hit, rules))
         all_rows.extend(hits)
         if hits:
-            frames[sym] = ann
+            kept[sym] = ann
+
+    return all_rows, kept, (start, end)
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    cfg = _build_config(args)
+    all_rows, frames, (start, end) = _sweep_history(args, cfg)
 
     if not all_rows:
         print("no historical signals found with these settings.", file=sys.stderr)
@@ -245,7 +309,7 @@ def cmd_history(args: argparse.Namespace) -> int:
             print(f"contact sheet -> {sheet}", file=sys.stderr)
         print(f"{len(paths)} charts -> {chart_dir}", file=sys.stderr)
 
-    path = _write(out, outdir / f"history_{args.years}y.csv", HISTORY_COLUMNS)
+    path = _write(out, outdir / f"history_{start}_{end}.csv", HISTORY_COLUMNS)
     (outdir / "history_stats.json").write_text(json.dumps(stats, indent=2, default=str))
     print(f"\n{len(out)} historical setups -> {path}", file=sys.stderr)
     print(json.dumps(stats, indent=2, default=str))
@@ -254,6 +318,78 @@ def cmd_history(args: argparse.Namespace) -> int:
         out.sort_values("r_multiple", ascending=False),
         ["date", "symbol", "state", "score", "close", "impulse_gain", "base_len",
          "base_depth", "adr20", "outcome", "r_multiple", "mfe_r", "days_held"],
+        args.limit,
+    )
+    return 0
+
+
+def cmd_backtest(args: argparse.Namespace) -> int:
+    """Replay every historical setup as one account, with real constraints."""
+    cfg = _build_config(args)
+    all_rows, frames, (start, end) = _sweep_history(args, cfg)
+    outdir = Path(args.out)
+
+    if not all_rows:
+        print("no signals in this window — nothing to backtest.", file=sys.stderr)
+        return 0
+
+    pcfg = PortfolioConfig(
+        starting_equity=args.starting_equity,
+        risk_pct=args.risk_pct if args.risk_pct is not None else cfg.risk_pct,
+        max_positions=args.max_positions,
+        max_position_pct=cfg.max_position_pct,
+        max_exposure_pct=args.max_exposure_pct,
+    )
+    print(
+        f"backtesting {len(all_rows)} signals · ${pcfg.starting_equity:,.0f} · "
+        f"{pcfg.risk_pct:.2%} risk · max {pcfg.max_positions} positions",
+        file=sys.stderr,
+    )
+    result = portfolio.run(all_rows, pcfg)
+
+    if result.trades.empty:
+        print("no signal ever triggered — nothing to report.", file=sys.stderr)
+        return 0
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    signals_df = pd.DataFrame(all_rows).sort_values(["date", "symbol"]).reset_index(drop=True)
+    _write(signals_df, outdir / f"backtest_signals_{start}_{end}.csv", HISTORY_COLUMNS)
+    result.trades.to_csv(outdir / f"backtest_trades_{start}_{end}.csv", index=False)
+    result.equity.to_csv(outdir / f"backtest_equity_{start}_{end}.csv", index=False)
+    (outdir / "backtest_stats.json").write_text(json.dumps(result.stats, indent=2, default=str))
+
+    curve = portfolio.plot_equity(result, outdir / f"equity_{start}_{end}.png", title=f"Breakout setup · {start} → {end}")
+    if curve:
+        print(f"equity curve -> {curve}", file=sys.stderr)
+
+    if args.charts:
+        chart_dir = outdir / "charts"
+        taken = set(zip(result.trades["symbol"], pd.to_datetime(result.trades["fill_date"])))
+        rendered = 0
+        for _, row in signals_df.sort_values("score", ascending=False).iterrows():
+            if rendered >= args.charts:
+                break
+            key = (row["symbol"], pd.Timestamp(row.get("fill_date")))
+            if key not in taken:
+                continue  # only chart trades the portfolio actually took
+            try:
+                plot_signal(
+                    frames[row["symbol"]],
+                    row.to_dict(),
+                    chart_dir / f"{row['symbol']}_{pd.Timestamp(row['date']).date()}.png",
+                    outcome=row.to_dict(),
+                )
+                rendered += 1
+            except Exception as exc:
+                print(f"  chart failed for {row['symbol']}: {exc}", file=sys.stderr)
+        print(f"{rendered} charts -> {chart_dir}", file=sys.stderr)
+
+    print(json.dumps(result.stats, indent=2, default=str))
+    print()
+    best = result.trades.sort_values("pnl", ascending=False)
+    _print_table(
+        pd.concat([best.head(args.limit // 2), best.tail(max(1, args.limit // 2))]),
+        ["symbol", "fill_date", "exit_date", "days_held", "shares", "fill", "r_multiple", "pnl", "equity_after"],
         args.limit,
     )
     return 0
@@ -343,27 +479,42 @@ def cmd_daily(args: argparse.Namespace) -> int:
     # ---- 2. filter ----------------------------------------------------------
     print(f"[2/4] applying filters to {len(symbols)} symbols …", file=sys.stderr)
     rows: list[dict[str, Any]] = []
-    rs_input: dict[str, float] = {}
     frames: dict[str, pd.DataFrame] = {}
     missing = 0
+
+    # Relative strength needs the whole universe ranked before any symbol can be
+    # judged, so collect the latest returns first.
+    latest_returns: dict[str, tuple[float, float, float]] = {}
     for sym in symbols:
         df = repo.load(sym)
         if df is None or len(df) < 140:
             missing += 1
             continue
         ann = annotate(df, cfg)
-        if pd.notna(ann["ret_3m"].iloc[-1]):
-            rs_input[sym] = float(ann["ret_3m"].iloc[-1])
-        hits = scan_symbol(df, cfg, symbol=sym)
+        frames[sym] = ann
+        row = ann.iloc[-1]
+        latest_returns[sym] = (
+            float(row["ret_1m"]) if pd.notna(row["ret_1m"]) else float("nan"),
+            float(row["ret_3m"]) if pd.notna(row["ret_3m"]) else float("nan"),
+            float(row["ret_6m"]) if pd.notna(row["ret_6m"]) else float("nan"),
+        )
+
+    ranks = strength.latest_ranks(latest_returns, cfg.rs_weights)
+    if cfg.min_rs_rank is not None and not ranks:
+        print("      (universe too small to rank; RS gate disabled)", file=sys.stderr)
+        cfg = cfg.with_overrides(min_rs_rank=None)
+
+    for sym, ann in frames.items():
+        hits = scan_frame(ann, cfg, symbol=sym, rs_value=ranks.get(sym))
         if hits:
             rows.extend(hits)
-            frames[sym] = ann
+
+    frames = {s: f for s, f in frames.items() if any(r["symbol"] == s for r in rows)}
 
     if rows:
         out = pd.DataFrame(rows)
-        if rs_input:
-            ranks = pd.Series(rs_input).rank(pct=True) * 100
-            out["rs_63d_rank"] = out["symbol"].map(ranks).round(1)
+        if ranks:
+            out["rs_rank"] = out["symbol"].map(ranks).round(1)
         out = out[out["score"] >= args.min_score]
         if args.state:
             out = out[out["state"] == args.state]
@@ -483,6 +634,8 @@ def _common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--limit", type=int, default=25)
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--set", action="append", metavar="KEY=VALUE", help="override any config field")
+    p.add_argument("--min-rs-rank", dest="min_rs_rank", type=float, default=None,
+                   help="require this cross-sectional 1m/3m/6m strength percentile (0-100)")
     for field, kind in (("min_price", float), ("min_dollar_volume", float), ("min_adr_pct", float),
                         ("max_base_depth", float), ("min_base_len", int), ("max_base_len", int),
                         ("max_dist_from_pivot", float), ("account_size", float),
@@ -503,16 +656,31 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--charts", type=int, default=0, metavar="N", help="render charts for the top N")
     s.set_defaults(func=cmd_scan)
 
+    def _sweep_opts(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--universe", default="sample")
+        p.add_argument("--start", default=None, metavar="YYYY-MM-DD",
+                       help="only emit signals on or after this date (e.g. 2018-01-01)")
+        p.add_argument("--end", default=None, metavar="YYYY-MM-DD")
+        p.add_argument("--years", type=int, default=5, help="used only when --start is omitted")
+        p.add_argument("--cooldown", type=int, default=10, help="bars before the same name can re-signal")
+        p.add_argument("--trail-ma", type=int, default=20, choices=[10, 20])
+        p.add_argument("--partial-days", type=int, default=4)
+
     h = sub.add_parser("history", help="find past setups and what happened next")
     _common(h)
-    h.add_argument("--universe", default="sample")
-    h.add_argument("--years", type=int, default=5)
-    h.add_argument("--cooldown", type=int, default=10, help="bars before the same name can re-signal")
+    _sweep_opts(h)
     h.add_argument("--charts", type=int, default=20, metavar="N")
     h.add_argument("--contact-sheet", action="store_true")
-    h.add_argument("--trail-ma", type=int, default=20, choices=[10, 20])
-    h.add_argument("--partial-days", type=int, default=4)
     h.set_defaults(func=cmd_history)
+
+    b = sub.add_parser("backtest", help="replay the setups as one account: equity curve, drawdown, CAGR")
+    _common(b)
+    _sweep_opts(b)
+    b.add_argument("--starting-equity", type=float, default=100_000.0)
+    b.add_argument("--max-positions", type=int, default=10, help="concurrent open positions")
+    b.add_argument("--max-exposure-pct", type=float, default=1.0, help="cap on total capital deployed")
+    b.add_argument("--charts", type=int, default=0, metavar="N", help="chart the top N trades actually taken")
+    b.set_defaults(func=cmd_backtest)
 
     def _fetch_opts(p: argparse.ArgumentParser) -> None:
         p.add_argument("--workers", type=int, default=8, help="parallel fetches; lower it if rate-limited")

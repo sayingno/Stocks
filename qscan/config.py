@@ -31,6 +31,15 @@ class BreakoutConfig:
     # this many bars of today, otherwise the move is stale.
     max_bars_since_impulse: int = 60
 
+    # ---- relative strength --------------------------------------------------
+    # The absolute thresholds above ask "did it move?"; this asks "did it move
+    # more than everything else?", which is what picks leaders out of a bull
+    # tape where everything is up. Percentile 0-100 against the universe on the
+    # same date; None disables the gate.
+    min_rs_rank: float | None = None
+    # Weights on the 1m / 3m / 6m percentile ranks that make the composite.
+    rs_weights: tuple[float, float, float] = (0.4, 0.3, 0.3)
+
     # ---- the consolidation --------------------------------------------------
     min_base_len: int = 3  # 3 days (tight flag) ...
     max_base_len: int = 60  # ... up to ~3 months
@@ -79,6 +88,7 @@ DEFAULT = BreakoutConfig()
 RELAXED = BreakoutConfig(
     min_dollar_volume=1_000_000.0,
     min_adr_pct=2.5,
+    min_rs_rank=None,
     move_lookbacks=((21, 0.20), (63, 0.35), (126, 0.60)),
     max_base_depth=0.45,
     max_contraction_ratio=1.15,
@@ -91,6 +101,7 @@ RELAXED = BreakoutConfig(
 STRICT = BreakoutConfig(
     min_dollar_volume=20_000_000.0,
     min_adr_pct=5.0,
+    min_rs_rank=90.0,  # top decile of the universe
     move_lookbacks=((21, 0.40), (63, 0.70), (126, 1.20)),
     max_base_len=40,
     max_base_depth=0.25,

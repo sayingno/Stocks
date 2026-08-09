@@ -122,6 +122,83 @@ def winner_after_signal(base: pd.DataFrame | None = None, run_pct: float = 0.55)
     return pd.concat([df, tail])
 
 
+def multi_cycle(
+    cycles: int = 12,
+    seed: int = 0,
+    start_price: float = 18.0,
+    win_rate: float = 0.35,
+    start: str = "2015-01-02",
+) -> pd.DataFrame:
+    """Years of bars containing repeated impulse → base → resolution cycles.
+
+    Enough history to exercise a date cutoff and a portfolio backtest. Winners
+    and losers are drawn at `win_rate` so the output is not uniformly one or the
+    other; prices are pulled back toward `start_price` between cycles so a long
+    run does not end up in the thousands.
+    """
+    rng = np.random.default_rng(seed)
+    closes: list[float] = []
+    ranges: list[float] = []
+    volumes: list[float] = []
+    price = start_price
+
+    def push(seq, rng_seq, vol_seq):
+        closes.extend(seq)
+        ranges.extend(rng_seq)
+        volumes.extend(vol_seq)
+
+    for _ in range(cycles):
+        # quiet drift
+        n = int(rng.integers(30, 70))
+        drift = _ramp(price, price * float(rng.uniform(0.92, 1.08)), n)
+        push(drift, np.full(n, 0.025), rng.uniform(0.6e6, 1.1e6, n))
+        price = float(drift[-1])
+
+        # impulse
+        n = int(rng.integers(10, 20))
+        gain = float(rng.uniform(0.45, 0.95))
+        imp = _ramp(price, price * (1 + gain), n)
+        push(imp, np.full(n, 0.075), rng.uniform(2.8e6, 4.2e6, n))
+        price = float(imp[-1])
+
+        # tightening base
+        n = int(rng.integers(12, 34))
+        depth = float(rng.uniform(0.08, 0.16))
+        low = price * (1 - depth)
+        half = n // 2
+        base = np.concatenate([_ramp(price * 0.99, low, half), _ramp(low * 1.01, price * 0.985, n - half)])
+        push(base, _ramp(0.065, 0.030, n), _ramp(1.5e6, 0.55e6, n))
+        price = float(base[-1])
+
+        # resolution
+        if rng.random() < win_rate:
+            n = int(rng.integers(20, 45))
+            run = _ramp(price * 1.04, price * (1 + float(rng.uniform(0.30, 0.75))), n)
+            push(run, np.full(n, 0.055), rng.uniform(1.8e6, 3.2e6, n))
+            price = float(run[-1])
+        else:
+            n = int(rng.integers(12, 30))
+            fail = _ramp(price * 1.02, price * float(rng.uniform(0.72, 0.88)), n)
+            push(fail, np.full(n, 0.055), rng.uniform(1.5e6, 2.6e6, n))
+            price = float(fail[-1])
+
+        # mean-revert toward the starting level so the series stays plottable
+        price = float(price * 0.6 + start_price * 0.4)
+        n = 12
+        settle = _ramp(closes[-1], price, n)
+        push(settle, np.full(n, 0.03), rng.uniform(0.7e6, 1.2e6, n))
+
+    # Smooth ramps almost never take out a stop, which would make any backtest
+    # against this fixture look absurdly good. Overlay a mean-reverting noise
+    # process so bars wander the way real ones do.
+    arr = np.asarray(closes, dtype=float)
+    noise = np.zeros(len(arr))
+    for i in range(1, len(arr)):
+        noise[i] = noise[i - 1] * 0.86 + rng.normal(0, 0.017)
+    arr = arr * (1.0 + noise)
+    return build(arr, ranges, volumes, start=start)
+
+
 def loser_after_signal(base: pd.DataFrame | None = None) -> pd.DataFrame:
     """Append an immediate failure that takes out the stop."""
     df = (base if base is not None else textbook_breakout()).copy()

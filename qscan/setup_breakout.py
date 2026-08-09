@@ -105,8 +105,16 @@ def _reject(reason: str, **fields: Any) -> dict[str, Any]:
     return {"passed": False, "reject": reason, **fields}
 
 
-def evaluate_bar(a: _Arrays, i: int, cfg: BreakoutConfig) -> dict[str, Any]:
+def evaluate_bar(
+    a: _Arrays,
+    i: int,
+    cfg: BreakoutConfig,
+    rs: np.ndarray | None = None,
+) -> dict[str, Any]:
     """Evaluate the breakout setup as of bar `i` (which is treated as 'today').
+
+    `rs` is an optional array of cross-sectional relative-strength percentiles
+    aligned to the same bars, used only when `cfg.min_rs_rank` is set.
 
     Returns a dict that always carries `passed` and, when False, a `reject`
     reason naming the first gate that failed.
@@ -152,6 +160,16 @@ def evaluate_bar(a: _Arrays, i: int, cfg: BreakoutConfig) -> dict[str, Any]:
     base_fields["move_ratio"] = best_ratio
     if best_ratio < 1.0:
         return _reject("no_prior_move", **base_fields)
+
+    # Relative strength: did it move more than the rest of the universe?
+    if rs is not None and i < len(rs):
+        rs_rank = float(rs[i])
+        base_fields["rs_rank"] = rs_rank
+        if cfg.min_rs_rank is not None:
+            if not math.isfinite(rs_rank) or rs_rank < cfg.min_rs_rank:
+                return _reject("weak_rs", **base_fields)
+    elif cfg.min_rs_rank is not None:
+        return _reject("no_rs_data", **base_fields)
 
     # ---- 3. locate the base -------------------------------------------------
     # The base is measured on bars strictly before today, so that "today broke
@@ -360,34 +378,65 @@ def _score(f: dict[str, Any], cfg: BreakoutConfig) -> float:
     return round(100.0 * sum(parts[k] * w for k, w in weights.items()), 1)
 
 
-def scan_symbol(
-    df: pd.DataFrame,
+def rs_array(ann: pd.DataFrame, rs_series: pd.Series | None) -> np.ndarray | None:
+    """Align a symbol's RS percentile series to its own bars."""
+    if rs_series is None:
+        return None
+    return rs_series.reindex(ann.index).to_numpy(dtype=float)
+
+
+def scan_frame(
+    ann: pd.DataFrame,
     cfg: BreakoutConfig,
     symbol: str = "",
     positions: Iterable[int] | None = None,
     keep_rejects: bool = False,
+    rs_series: pd.Series | None = None,
+    rs_value: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Run the detector over one symbol.
+    """Run the detector over an already-annotated frame.
 
-    `positions` defaults to the last bar only. Pass a range to sweep history.
+    Callers that annotate anyway should use this rather than `scan_symbol`, which
+    would annotate a second time. `rs_value` is the single-date shortcut used by
+    the daily scan; `rs_series` is the full history used by the sweep.
     """
-    ann = annotate(df, cfg)
     if len(ann) == 0:
         return []
     a = _Arrays.from_frame(ann)
+    if rs_series is not None:
+        rs = rs_array(ann, rs_series)
+    elif rs_value is not None:
+        rs = np.full(len(ann), float(rs_value))
+    else:
+        rs = None
     idx = list(positions) if positions is not None else [len(a) - 1]
 
     hits: list[dict[str, Any]] = []
     for i in idx:
         if i < 0 or i >= len(a):
             continue
-        res = evaluate_bar(a, i, cfg)
+        res = evaluate_bar(a, i, cfg, rs=rs)
         if res["passed"] or keep_rejects:
             res["symbol"] = symbol
             res.setdefault("date", pd.Timestamp(a.date[i]))
             res["bar"] = i
             hits.append(res)
     return hits
+
+
+def scan_symbol(
+    df: pd.DataFrame,
+    cfg: BreakoutConfig,
+    symbol: str = "",
+    positions: Iterable[int] | None = None,
+    keep_rejects: bool = False,
+    rs_series: pd.Series | None = None,
+    rs_value: float | None = None,
+) -> list[dict[str, Any]]:
+    """Annotate raw OHLCV and run the detector. See `scan_frame`."""
+    return scan_frame(
+        annotate(df, cfg), cfg, symbol, positions, keep_rejects, rs_series, rs_value
+    )
 
 
 def dedupe_signals(hits: list[dict[str, Any]], cooldown: int = 10) -> list[dict[str, Any]]:

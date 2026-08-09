@@ -36,16 +36,27 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data/demo")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--long-names", type=int, default=0, metavar="N",
+                    help="also emit N multi-year symbols (LONG00…) for cutoff and backtest testing")
+    ap.add_argument("--long-start", default="2015-01-02")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    for name, builder in BUILDERS.items():
+    builders = dict(BUILDERS)
+    for i in range(args.long_names):
+        builders[f"LONG{i:02d}"] = (
+            lambda i=i: synthetic.multi_cycle(cycles=14, seed=args.seed + i, start=args.long_start,
+                                              start_price=float(12 + 6 * (i % 5)))
+        )
+
+    for name, builder in builders.items():
         df = builder().copy()
-        # Anchor the last bar to today so the default scan window covers it.
-        df.index = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=len(df))
+        if not name.startswith("LONG"):
+            # Anchor short fixtures to today so the default scan window covers them.
+            df.index = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=len(df))
         # A touch of noise so every file is not pathologically smooth.
         jitter = 1.0 + rng.normal(0, 0.0015, len(df))
         for col in ("open", "high", "low", "close"):
@@ -55,8 +66,8 @@ def main() -> int:
         df.index.name = "date"
         df.round(4).to_csv(out / f"{name}.csv")
 
-    (out / "universe.txt").write_text("\n".join(BUILDERS) + "\n")
-    print(f"wrote {len(BUILDERS)} symbols + universe.txt to {out}")
+    (out / "universe.txt").write_text("\n".join(builders) + "\n")
+    print(f"wrote {len(builders)} symbols + universe.txt to {out}")
     return 0
 
 
