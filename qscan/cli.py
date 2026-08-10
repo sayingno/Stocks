@@ -26,6 +26,7 @@ from .config import PRESETS, BreakoutConfig
 from .data import DataError, PriceStore, default_window
 from .indicators import annotate
 from .outcomes import TradeRules, forward_returns, simulate_trade, summarise
+from . import ingest as ingest_mod
 from . import portfolio, setups, strength
 from .portfolio import PortfolioConfig
 from .report import build_report
@@ -333,6 +334,31 @@ def cmd_history(args: argparse.Namespace) -> int:
         args.limit,
     )
     return 0
+
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    """Load bulk vendor archives into the price database."""
+    from .repository import PriceRepository
+
+    sources = [Path(p) for p in args.sources]
+    missing = [str(p) for p in sources if not p.exists()]
+    if missing:
+        raise DataError(f"no such path: {missing}")
+
+    repo = PriceRepository(root=args.repo or "data", provider=args.provider, csv_dir=args.csv_dir)
+    print(f"ingesting {len(sources)} source(s) into {repo.price_dir} …", file=sys.stderr)
+    report = ingest_mod.ingest(sources, repo, merge=not args.no_merge)
+
+    print(json.dumps({"ingest": report.as_dict(), "coverage": repo.coverage()}, indent=2, default=str))
+    if report.skipped:
+        print(f"\n{len(report.skipped)} file(s) skipped — first few:", file=sys.stderr)
+        for name, why in report.skipped[:8]:
+            print(f"  {name}: {why}", file=sys.stderr)
+    if report.symbols:
+        uni = Path(args.repo or "data") / "universe.txt"
+        uni.write_text("\n".join(sorted(repo.symbols())) + "\n")
+        print(f"\nuniverse written to {uni} ({len(repo.symbols())} symbols)", file=sys.stderr)
+    return 0 if report.symbols else 1
 
 
 def cmd_backtest(args: argparse.Namespace) -> int:
@@ -742,6 +768,14 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--max-stale-days", type=int, default=5,
                    help="exit non-zero if the newest bar is older than this (default 5)")
     d.set_defaults(func=cmd_daily)
+
+    g = sub.add_parser("ingest", help="load vendor zips / folders / a long CSV into the price database")
+    _common(g)
+    g.add_argument("sources", nargs="+", metavar="PATH",
+                   help="zip files, directories of CSVs, or one long-format CSV")
+    g.add_argument("--no-merge", action="store_true",
+                   help="let a later archive replace an earlier one instead of combining")
+    g.set_defaults(func=cmd_ingest)
 
     e = sub.add_parser("explain", help="show every measured value for one symbol/date")
     _common(e)

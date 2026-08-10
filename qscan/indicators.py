@@ -16,8 +16,27 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """Lower-case the columns, sort by date, drop unusable rows."""
     out = df.copy()
     out.columns = [str(c).strip().lower() for c in out.columns]
-    if "adj close" in out.columns and "close" not in out.columns:
-        out = out.rename(columns={"adj close": "close"})
+    out = out.rename(columns={"adj_close": "adj close", "adjclose": "adj close"})
+
+    if "adj close" in out.columns:
+        if "close" not in out.columns:
+            out = out.rename(columns={"adj close": "close"})
+        else:
+            # A vendor file carrying both is the classic silent corruption: the
+            # raw close still contains every split, so a 2:1 shows up as a 50%
+            # cliff the detector reads as a real move. Adjust — and scale the
+            # whole bar by the same ratio, because adjusting the close alone
+            # would leave high < close and wreck every range and ADR.
+            close = pd.to_numeric(out["close"], errors="coerce")
+            adj = pd.to_numeric(out["adj close"], errors="coerce")
+            ratio = (adj / close.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+            if ratio.notna().any():
+                ratio = ratio.fillna(1.0)
+                for col in ("open", "high", "low", "close"):
+                    if col in out.columns:
+                        out[col] = pd.to_numeric(out[col], errors="coerce") * ratio
+            out = out.drop(columns=["adj close"])
+
     missing = [c for c in OHLCV if c not in out.columns]
     if missing:
         raise ValueError(f"missing OHLCV columns: {missing} (have {list(out.columns)})")
@@ -27,6 +46,16 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     out = out[~out.index.duplicated(keep="last")].sort_index()
     out = out.astype(float)
     out = out[(out[["open", "high", "low", "close"]] > 0).all(axis=1)]
+
+    # Repair impossible bars. Vendor files — especially ones where only some
+    # columns were adjusted — can arrive with high < close or low > open. Left
+    # alone, that produces a negative daily range, which poisons ADR and every
+    # gate built on it. Widening the extremes is the conservative fix: it never
+    # invents a move that wasn't there.
+    body_high = out[["open", "close"]].max(axis=1)
+    body_low = out[["open", "close"]].min(axis=1)
+    out["high"] = out[["high"]].join(body_high.rename("b")).max(axis=1)
+    out["low"] = out[["low"]].join(body_low.rename("b")).min(axis=1)
     return out
 
 
