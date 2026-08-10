@@ -1,0 +1,96 @@
+name: Daily breakout scan
+
+# 22:00 UTC on weekdays — comfortably after the US close in both EST (17:00) and
+# EDT (18:00). GitHub's scheduler is best-effort and can run late under load.
+on:
+  schedule:
+    - cron: "0 22 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      universe:
+        description: "Universe name or file under universes/"
+        default: "sample"
+      preset:
+        description: "relaxed | default | strict"
+        default: "default"
+      charts:
+        description: "How many charts to render"
+        default: "25"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      QSCAN_UNIVERSE: ${{ inputs.universe || 'sample' }}
+      QSCAN_PRESET: ${{ inputs.preset || 'default' }}
+      QSCAN_CHARTS: ${{ inputs.charts || '25' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # The price database is what makes the run incremental. Restoring it means
+      # each day fetches only the new bars instead of years of history.
+      # A cache entry is immutable, so the key carries the run number and
+      # restore-keys fall back to the most recent previous build.
+      - name: Restore price database
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: qscan-prices-${{ env.QSCAN_UNIVERSE }}-${{ github.run_number }}
+          restore-keys: |
+            qscan-prices-${{ env.QSCAN_UNIVERSE }}-
+
+      - name: Run the daily scan
+        run: |
+          python -m qscan daily \
+            --universe "$QSCAN_UNIVERSE" \
+            --preset "$QSCAN_PRESET" \
+            --provider yfinance \
+            --repo data \
+            --out out \
+            --charts "$QSCAN_CHARTS" \
+            --workers 4 \
+            --pause 0.1 \
+          | tee summary.json
+
+      - name: Summarise on the run page
+        if: always()
+        run: |
+          {
+            echo "## Breakout scan — $(date -u +%F)"
+            echo
+            if [ -f summary.json ]; then
+              echo '```json'
+              cat summary.json
+              echo '```'
+            fi
+            echo
+            echo "Download the **report** artifact and open \`latest.html\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ github.run_number }}
+          path: |
+            out/*.html
+            out/*.csv
+            out/charts/**
+          retention-days: 30
+          if-no-files-found: warn

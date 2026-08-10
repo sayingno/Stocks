@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# scanner artifacts
+data/
+out/
+logs/
+*.png
+!docs/*.png
+.qscan.lock
+.qscan.lock.d/
