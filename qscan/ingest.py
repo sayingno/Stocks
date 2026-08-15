@@ -74,9 +74,26 @@ def canonical_columns(columns) -> dict[str, str]:
 
 
 def _read_tabular(handle, name: str) -> pd.DataFrame | None:
+    """Read a table, keeping any symbol column as text.
+
+    Pandas infers `000001` as the integer 1, which silently destroys every
+    zero-padded ticker — the Shenzhen half of the A-share market, most of Hong
+    Kong, and any vendor that pads US symbols. The symbol column is read as a
+    string; everything else is left to normal inference so a 600 MB file of
+    prices does not become 600 MB of Python strings.
+    """
     sep = "\t" if name.lower().endswith(".tsv") else None
     try:
-        return pd.read_csv(handle, sep=sep, engine="python")
+        header = pd.read_csv(handle, sep=sep, engine="python", nrows=0)
+    except Exception:
+        return None
+
+    dtypes = {c: str for c in header.columns
+              if str(c).strip().lower() in ALIASES and ALIASES[str(c).strip().lower()] == "symbol"}
+    if hasattr(handle, "seek"):
+        handle.seek(0)  # a BytesIO from a zip must be rewound; a Path need not be
+    try:
+        return pd.read_csv(handle, sep=sep, engine="python", dtype=dtypes or None)
     except Exception:
         return None
 

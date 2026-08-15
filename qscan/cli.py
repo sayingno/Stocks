@@ -26,7 +26,9 @@ from .config import PRESETS, BreakoutConfig
 from .data import DataError, PriceStore, default_window
 from .indicators import annotate
 from .outcomes import TradeRules, forward_returns, simulate_trade, summarise
+from . import earnings as earnings_mod
 from . import ingest as ingest_mod
+from . import study as study_mod
 from . import portfolio, setups, strength
 from .portfolio import PortfolioConfig
 from .report import build_report
@@ -333,6 +335,78 @@ def cmd_history(args: argparse.Namespace) -> int:
          "base_depth", "adr20", "outcome", "r_multiple", "mfe_r", "days_held"],
         args.limit,
     )
+    return 0
+
+
+def cmd_study(args: argparse.Namespace) -> int:
+    """Event study: what did the big movers look like before they moved?"""
+    setup = _setup(args)
+    cfg = _build_config(args)
+    store = _make_store(args)
+    symbols = universe_mod.load(args.universe)
+    start, end = _history_window(args)
+    load_start = (pd.Timestamp(start) - pd.Timedelta(days=500)).date().isoformat()
+    outdir = Path(args.out)
+
+    cal: dict[str, list] = {}
+    if args.earnings:
+        cal = earnings_mod.load(args.earnings)
+        print(f"earnings calendar: {len(cal)} symbols", file=sys.stderr)
+    elif args.event == "earnings" and args.infer_earnings:
+        print("no calendar given — inferring reaction days from price action", file=sys.stderr)
+
+    scfg = study_mod.StudyConfig(
+        event=args.event,
+        min_gap=args.min_gap,
+        outcome_horizon=args.horizon,
+        outcome_threshold=args.mover_threshold,
+        min_dollar_volume=cfg.min_dollar_volume if args.apply_liquidity else 0.0,
+    )
+
+    print(f"loading {len(symbols)} symbols …", file=sys.stderr)
+    frames: dict[str, pd.DataFrame] = {}
+    for n, sym in enumerate(symbols, 1):
+        if args.verbose and n % 200 == 0:
+            print(f"  {n}/{len(symbols)}", file=sys.stderr)
+        try:
+            df = store.get(sym, load_start, end, refresh=args.refresh)
+        except Exception:
+            continue
+        if len(df) < scfg.min_history + scfg.outcome_horizon + 5:
+            continue
+        ann = annotate(df, cfg)
+        if args.event == "earnings" and sym not in cal and args.infer_earnings:
+            cal[sym] = earnings_mod.infer_from_prices(ann)
+        frames[sym] = ann
+
+    if not frames:
+        print("no usable symbols.", file=sys.stderr)
+        return 1
+
+    result = study_mod.run(
+        frames, scfg, earnings=cal or None, start=pd.Timestamp(start),
+        bucket_fields=args.by.split(",") if args.by else None, buckets=args.buckets,
+    )
+    if result.events.empty:
+        print("no events matched.", file=sys.stderr)
+        return 0
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    tag = f"{args.event}_{start}_{end}"
+    result.events.to_csv(outdir / f"study_events_{tag}.csv", index=False)
+    result.cohorts.to_csv(outdir / f"study_cohorts_{tag}.csv", index=False)
+    for fname, tbl in result.buckets.items():
+        tbl.to_csv(outdir / f"study_bucket_{fname}_{tag}.csv", index=False)
+    (outdir / "study_summary.json").write_text(json.dumps(result.summary, indent=2, default=str))
+
+    print(json.dumps(result.summary, indent=2, default=str))
+    print("\n── what separated the movers from the rest ──")
+    print("   (|t| < 2 is noise, however big the lift looks)\n")
+    _print_table(result.cohorts, list(result.cohorts.columns), 20)
+    for fname, tbl in result.buckets.items():
+        print(f"\n── P(mover) by {fname} · base rate {result.summary['base_rate']:.1%} ──")
+        _print_table(tbl, list(tbl.columns), 20)
+    print(f"\nwritten to {outdir}/study_*_{tag}.csv", file=sys.stderr)
     return 0
 
 
@@ -768,6 +842,29 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--max-stale-days", type=int, default=5,
                    help="exit non-zero if the newest bar is older than this (default 5)")
     d.set_defaults(func=cmd_daily)
+
+    st = sub.add_parser("study", help="event study: what did the big movers look like beforehand?")
+    _common(st)
+    st.add_argument("--universe", default="sample")
+    st.add_argument("--start", default=None, metavar="YYYY-MM-DD")
+    st.add_argument("--end", default=None, metavar="YYYY-MM-DD")
+    st.add_argument("--years", type=int, default=5)
+    st.add_argument("--event", choices=["gap", "earnings", "all"], default="gap",
+                    help="what raises an event")
+    st.add_argument("--min-gap", type=float, default=0.05, help="for --event gap")
+    st.add_argument("--earnings", default=None, metavar="CSV",
+                    help="earnings calendar (symbol,date)")
+    st.add_argument("--infer-earnings", action="store_true",
+                    help="with --event earnings and no calendar, guess from price action (a proxy)")
+    st.add_argument("--horizon", type=int, default=10, help="bars forward to measure the outcome")
+    st.add_argument("--mover-threshold", type=float, default=0.20,
+                    help="forward return that makes an event a 'mover'")
+    st.add_argument("--by", default="ret_3d,ret_1w,ret_1m,ret_3m",
+                    help="comma-separated antecedents to bucket on")
+    st.add_argument("--buckets", type=int, default=5)
+    st.add_argument("--apply-liquidity", action="store_true",
+                    help="also require the preset's dollar-volume floor")
+    st.set_defaults(func=cmd_study)
 
     g = sub.add_parser("ingest", help="load vendor zips / folders / a long CSV into the price database")
     _common(g)

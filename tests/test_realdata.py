@@ -223,3 +223,49 @@ class TestUniverseScale(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestZeroPaddedTickers(unittest.TestCase):
+    """Regression: pandas reads 000001 as the integer 1.
+
+    That silently unmatches the entire Shenzhen half of the A-share market,
+    most of Hong Kong, and any vendor that zero-pads. The failure is invisible —
+    the ingest reports success and the symbols simply never join.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_long_format_preserves_leading_zeros(self):
+        from qscan.ingest import _read_tabular
+
+        rows = []
+        for sym in ("000001", "000858", "600519"):
+            d = synthetic.textbook_breakout().head(30)
+            rows.append(pd.DataFrame({
+                "symbol": sym, "date": d.index.date, "open": d.open,
+                "high": d.high, "low": d.low, "close": d.close, "volume": d.volume,
+            }))
+        path = self.tmp / "long.csv"
+        pd.concat(rows).to_csv(path, index=False)
+
+        df = _read_tabular(path, "long.csv")
+        self.assertEqual(set(df["symbol"].unique()), {"000001", "000858", "600519"})
+
+    def test_prices_are_still_numeric_after_the_symbol_fix(self):
+        """Reading the symbol as text must not turn the price columns into strings."""
+        from qscan.ingest import _read_tabular
+
+        d = synthetic.textbook_breakout().head(20)
+        path = self.tmp / "l2.csv"
+        pd.DataFrame({
+            "symbol": "000001", "date": d.index.date, "open": d.open, "high": d.high,
+            "low": d.low, "close": d.close, "volume": d.volume,
+        }).to_csv(path, index=False)
+
+        df = _read_tabular(path, "l2.csv")
+        for col in ("open", "high", "low", "close", "volume"):
+            self.assertTrue(pd.api.types.is_numeric_dtype(df[col]), f"{col} became text")
