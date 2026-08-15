@@ -79,6 +79,27 @@ def _build_config(args: argparse.Namespace):
         value = getattr(args, field, None)
         if value is not None and field in valid:
             overrides[field] = value
+    for horizon in ("3d", "1w", "1m", "3m"):
+        spec = getattr(args, f"perf_{horizon}", None)
+        key = f"perf_{horizon}"
+        if not spec or key not in valid:
+            continue
+        lo = hi = None
+        for part in str(spec).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            side, _, raw = part.partition("=")
+            if not _:
+                raise SystemExit(f"--perf-{horizon} expects min=..,max=.., got {spec!r}")
+            if side.strip() == "min":
+                lo = float(raw)
+            elif side.strip() == "max":
+                hi = float(raw)
+            else:
+                raise SystemExit(f"--perf-{horizon}: unknown side {side!r}")
+        overrides[key] = (lo, hi)
+
     if getattr(args, "set", None):
         for pair in args.set:
             key, _, raw = pair.partition("=")
@@ -770,6 +791,10 @@ def _common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--set", action="append", metavar="KEY=VALUE", help="override any config field")
     p.add_argument("--min-rs-rank", dest="min_rs_rank", type=float, default=None,
                    help="require this cross-sectional 1m/3m/6m strength percentile (0-100)")
+    for horizon in ("3d", "1w", "1m", "3m"):
+        p.add_argument(f"--perf-{horizon}", dest=f"perf_{horizon}", default=None,
+                       metavar="min=..,max=..",
+                       help=f"bound the run-up over {horizon} into the event, e.g. max=0.05")
     for field, kind in (("min_price", float), ("min_dollar_volume", float), ("min_adr_pct", float),
                         ("max_base_depth", float), ("min_base_len", int), ("max_base_len", int),
                         ("max_dist_from_pivot", float), ("account_size", float),
