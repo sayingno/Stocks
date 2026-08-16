@@ -135,7 +135,10 @@ def annotate(df: pd.DataFrame, cfg) -> pd.DataFrame:
     out["vol_avg20"] = out["volume"].rolling(20, min_periods=10).mean()
     out["range_pct"] = out["high"] / out["low"] - 1.0
 
-    for n, label in ((21, "1m"), (63, "3m"), (126, "6m")):
+    # Short horizons matter for the episodic pivot: a stock already up 8% into
+    # the print has partly priced the news, which is a different animal from one
+    # that was dead going in.
+    for n, label in ((3, "3d"), (5, "1w"), (21, "1m"), (63, "3m"), (126, "6m")):
         out[f"ret_{label}"] = pct_change_n(close, n)
 
     out["ma_mid_slope"] = slope_pct_per_bar(out["ma_mid"], cfg.ma_mid)

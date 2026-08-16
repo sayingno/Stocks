@@ -99,6 +99,24 @@ def evaluate_bar(a: _Arrays, i: int, cfg: EPConfig, rs: np.ndarray | None = None
     if band > cfg.max_dormant_band:
         return reject("not_dormant", **f)
 
+    # ---- run-up into the event, per horizon ---------------------------------
+    # Measured to the bar before the gap, so the gap itself is never part of
+    # "what did it look like going in".
+    for label, bars in (("3d", 3), ("1w", 5), ("1m", 21), ("3m", 63)):
+        bounds = getattr(cfg, f"perf_{label}", None)
+        prior = a.close[i - 1 - bars] if i - 1 - bars >= 0 else float("nan")
+        value = (prev_close / prior - 1.0) if prior > 0 and math.isfinite(prior) else float("nan")
+        f[f"pre_ret_{label}"] = value
+        if bounds is None:
+            continue
+        lo_b, hi_b = bounds
+        if not math.isfinite(value):
+            return reject(f"no_perf_{label}", **f)
+        if lo_b is not None and value < lo_b:
+            return reject(f"perf_{label}_too_low", **f)
+        if hi_b is not None and value > hi_b:
+            return reject(f"perf_{label}_too_high", **f)
+
     # ---- the gap must clear the base ----------------------------------------
     f["base_high"] = window_high
     if close < window_high:

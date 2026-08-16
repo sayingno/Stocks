@@ -26,7 +26,10 @@ from .config import PRESETS, BreakoutConfig
 from .data import DataError, PriceStore, default_window
 from .indicators import annotate
 from .outcomes import TradeRules, forward_returns, simulate_trade, summarise
+from . import earnings as earnings_mod
 from . import ingest as ingest_mod
+from . import study as study_mod
+from . import summary as summary_mod
 from . import portfolio, setups, strength
 from .portfolio import PortfolioConfig
 from .report import build_report
@@ -77,6 +80,27 @@ def _build_config(args: argparse.Namespace):
         value = getattr(args, field, None)
         if value is not None and field in valid:
             overrides[field] = value
+    for horizon in ("3d", "1w", "1m", "3m"):
+        spec = getattr(args, f"perf_{horizon}", None)
+        key = f"perf_{horizon}"
+        if not spec or key not in valid:
+            continue
+        lo = hi = None
+        for part in str(spec).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            side, _, raw = part.partition("=")
+            if not _:
+                raise SystemExit(f"--perf-{horizon} expects min=..,max=.., got {spec!r}")
+            if side.strip() == "min":
+                lo = float(raw)
+            elif side.strip() == "max":
+                hi = float(raw)
+            else:
+                raise SystemExit(f"--perf-{horizon}: unknown side {side!r}")
+        overrides[key] = (lo, hi)
+
     if getattr(args, "set", None):
         for pair in args.set:
             key, _, raw = pair.partition("=")
@@ -333,6 +357,131 @@ def cmd_history(args: argparse.Namespace) -> int:
          "base_depth", "adr20", "outcome", "r_multiple", "mfe_r", "days_held"],
         args.limit,
     )
+    return 0
+
+
+def cmd_summary(args: argparse.Namespace) -> int:
+    """Inventory the price database: what is in it, and is any of it usable?"""
+    store = _make_store(args)
+    if store.repo is not None:
+        symbols = store.repo.symbols()
+    else:
+        symbols = universe_mod.load(args.universe)
+    if not symbols:
+        raise DataError("no symbols found — ingest or update first")
+
+    print(f"reading {len(symbols)} symbols from {store.name} …", file=sys.stderr)
+    frames: dict[str, pd.DataFrame] = {}
+    failed = 0
+    for n, sym in enumerate(symbols, 1):
+        if args.verbose and n % 500 == 0:
+            print(f"  {n}/{len(symbols)}", file=sys.stderr)
+        try:
+            df = store.get(sym, "1900-01-01", "2100-01-01")
+        except Exception:
+            failed += 1
+            continue
+        if df is not None and not df.empty:
+            frames[sym] = df
+
+    result = summary_mod.summarise(frames, min_bars=args.min_bars)
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    result.per_symbol.to_csv(outdir / "dataset_symbols.csv", index=False)
+    payload = {
+        "overview": result.overview,
+        "warnings": result.warnings,
+        "unreadable_symbols": failed,
+        "suggested_thresholds": summary_mod.suggest_thresholds(result),
+    }
+    (outdir / "dataset_summary.json").write_text(json.dumps(payload, indent=2, default=str))
+
+    print(json.dumps(payload, indent=2, default=str))
+    if result.warnings:
+        print("\n── worth checking ──", file=sys.stderr)
+        for w in result.warnings:
+            print(f"  ! {w}", file=sys.stderr)
+    print(f"\nper-symbol table -> {outdir}/dataset_symbols.csv", file=sys.stderr)
+    print()
+    _print_table(
+        result.per_symbol.sort_values("median_dollar_vol", ascending=False),
+        ["symbol", "bars", "first", "last", "years", "coverage", "last_close",
+         "median_dollar_vol", "median_adr_pct", "suspect_jumps"],
+        args.limit,
+    )
+    return 0
+
+
+def cmd_study(args: argparse.Namespace) -> int:
+    """Event study: what did the big movers look like before they moved?"""
+    setup = _setup(args)
+    cfg = _build_config(args)
+    store = _make_store(args)
+    symbols = universe_mod.load(args.universe)
+    start, end = _history_window(args)
+    load_start = (pd.Timestamp(start) - pd.Timedelta(days=500)).date().isoformat()
+    outdir = Path(args.out)
+
+    cal: dict[str, list] = {}
+    if args.earnings:
+        cal = earnings_mod.load(args.earnings)
+        print(f"earnings calendar: {len(cal)} symbols", file=sys.stderr)
+    elif args.event == "earnings" and args.infer_earnings:
+        print("no calendar given — inferring reaction days from price action", file=sys.stderr)
+
+    scfg = study_mod.StudyConfig(
+        event=args.event,
+        min_gap=args.min_gap,
+        max_gap=args.max_gap,
+        outcome_horizon=args.horizon,
+        outcome_threshold=args.mover_threshold,
+        min_dollar_volume=cfg.min_dollar_volume if args.apply_liquidity else 0.0,
+    )
+
+    print(f"loading {len(symbols)} symbols …", file=sys.stderr)
+    frames: dict[str, pd.DataFrame] = {}
+    for n, sym in enumerate(symbols, 1):
+        if args.verbose and n % 200 == 0:
+            print(f"  {n}/{len(symbols)}", file=sys.stderr)
+        try:
+            df = store.get(sym, load_start, end, refresh=args.refresh)
+        except Exception:
+            continue
+        if len(df) < scfg.min_history + scfg.outcome_horizon + 5:
+            continue
+        ann = annotate(df, cfg)
+        if args.event == "earnings" and sym not in cal and args.infer_earnings:
+            cal[sym] = earnings_mod.infer_from_prices(ann)
+        frames[sym] = ann
+
+    if not frames:
+        print("no usable symbols.", file=sys.stderr)
+        return 1
+
+    result = study_mod.run(
+        frames, scfg, earnings=cal or None, start=pd.Timestamp(start),
+        bucket_fields=args.by.split(",") if args.by else None, buckets=args.buckets,
+    )
+    if result.events.empty:
+        print("no events matched.", file=sys.stderr)
+        return 0
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    tag = f"{args.event}_{start}_{end}"
+    result.events.to_csv(outdir / f"study_events_{tag}.csv", index=False)
+    result.cohorts.to_csv(outdir / f"study_cohorts_{tag}.csv", index=False)
+    for fname, tbl in result.buckets.items():
+        tbl.to_csv(outdir / f"study_bucket_{fname}_{tag}.csv", index=False)
+    (outdir / "study_summary.json").write_text(json.dumps(result.summary, indent=2, default=str))
+
+    print(json.dumps(result.summary, indent=2, default=str))
+    print("\n── what separated the movers from the rest ──")
+    print("   (|t| < 2 is noise, however big the lift looks)\n")
+    _print_table(result.cohorts, list(result.cohorts.columns), 20)
+    for fname, tbl in result.buckets.items():
+        print(f"\n── P(mover) by {fname} · base rate {result.summary['base_rate']:.1%} ──")
+        _print_table(tbl, list(tbl.columns), 20)
+    print(f"\nwritten to {outdir}/study_*_{tag}.csv", file=sys.stderr)
     return 0
 
 
@@ -696,6 +845,10 @@ def _common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--set", action="append", metavar="KEY=VALUE", help="override any config field")
     p.add_argument("--min-rs-rank", dest="min_rs_rank", type=float, default=None,
                    help="require this cross-sectional 1m/3m/6m strength percentile (0-100)")
+    for horizon in ("3d", "1w", "1m", "3m"):
+        p.add_argument(f"--perf-{horizon}", dest=f"perf_{horizon}", default=None,
+                       metavar="min=..,max=..",
+                       help=f"bound the run-up over {horizon} into the event, e.g. max=0.05")
     for field, kind in (("min_price", float), ("min_dollar_volume", float), ("min_adr_pct", float),
                         ("max_base_depth", float), ("min_base_len", int), ("max_base_len", int),
                         ("max_dist_from_pivot", float), ("account_size", float),
@@ -768,6 +921,38 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--max-stale-days", type=int, default=5,
                    help="exit non-zero if the newest bar is older than this (default 5)")
     d.set_defaults(func=cmd_daily)
+
+    st = sub.add_parser("study", help="event study: what did the big movers look like beforehand?")
+    _common(st)
+    st.add_argument("--universe", default="sample")
+    st.add_argument("--start", default=None, metavar="YYYY-MM-DD")
+    st.add_argument("--end", default=None, metavar="YYYY-MM-DD")
+    st.add_argument("--years", type=int, default=5)
+    st.add_argument("--event", choices=["gap", "earnings", "all"], default="gap",
+                    help="what raises an event")
+    st.add_argument("--min-gap", type=float, default=0.05,
+                    help="lower bound on the gap (open vs prior close)")
+    st.add_argument("--max-gap", type=float, default=None,
+                    help="upper bound, e.g. --min-gap 0.05 --max-gap 0.10 for a 5-10%% gap up")
+    st.add_argument("--earnings", default=None, metavar="CSV",
+                    help="earnings calendar (symbol,date)")
+    st.add_argument("--infer-earnings", action="store_true",
+                    help="with --event earnings and no calendar, guess from price action (a proxy)")
+    st.add_argument("--horizon", type=int, default=10, help="bars forward to measure the outcome")
+    st.add_argument("--mover-threshold", type=float, default=0.20,
+                    help="forward return that makes an event a 'mover'")
+    st.add_argument("--by", default="ret_3d,ret_1w,ret_1m,ret_3m",
+                    help="comma-separated antecedents to bucket on")
+    st.add_argument("--buckets", type=int, default=5)
+    st.add_argument("--apply-liquidity", action="store_true",
+                    help="also require the preset's dollar-volume floor")
+    st.set_defaults(func=cmd_study)
+
+    sm = sub.add_parser("summary", help="inventory the dataset: tickers, coverage, liquidity, warnings")
+    _common(sm)
+    sm.add_argument("--universe", default="sample", help="ignored when --repo is given")
+    sm.add_argument("--min-bars", type=int, default=200, help="bars needed to call a symbol usable")
+    sm.set_defaults(func=cmd_summary)
 
     g = sub.add_parser("ingest", help="load vendor zips / folders / a long CSV into the price database")
     _common(g)

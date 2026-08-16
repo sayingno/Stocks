@@ -134,6 +134,15 @@ class EPConfig:
     max_prior_gain: float = 0.50  # it must not already have run
     max_dormant_band: float = 0.60  # high-to-low range of that stretch
 
+    # Two-sided bounds on the run-up into the event, per horizon. (min, max),
+    # either side None to leave it open; None disables the horizon entirely.
+    # Each asks a different question: 3d is "was it already moving into the
+    # print?", 3m is "was it genuinely dormant?".
+    perf_3d: tuple[float | None, float | None] | None = None
+    perf_1w: tuple[float | None, float | None] | None = None
+    perf_1m: tuple[float | None, float | None] | None = None
+    perf_3m: tuple[float | None, float | None] | None = None
+
     # holding the gap
     min_close_position: float = 0.50  # close in the upper half of the day
     require_close_above_open: bool = True

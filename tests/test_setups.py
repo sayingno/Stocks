@@ -200,3 +200,42 @@ class TestRegistry(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEpPerfWindows(unittest.TestCase):
+    """Two-sided run-up bounds, one per horizon."""
+
+    def setUp(self):
+        self.df = synthetic.episodic_pivot()
+
+    def run_cfg(self, **over):
+        return last(self.df, ep_eval, EP_DEFAULT.with_overrides(**over))
+
+    def test_unbounded_by_default(self):
+        res = self.run_cfg()
+        self.assertTrue(res["passed"], res.get("reject"))
+        for h in ("3d", "1w", "1m", "3m"):
+            self.assertIn(f"pre_ret_{h}", res)
+
+    def test_upper_bound_rejects_a_name_that_already_ran(self):
+        res = self.run_cfg(perf_3m=(None, -0.50))
+        self.assertFalse(res["passed"])
+        self.assertEqual(res["reject"], "perf_3m_too_high")
+
+    def test_lower_bound_rejects_a_name_that_did_nothing(self):
+        res = self.run_cfg(perf_3m=(0.50, None))
+        self.assertFalse(res["passed"])
+        self.assertEqual(res["reject"], "perf_3m_too_low")
+
+    def test_range_that_contains_the_value_passes(self):
+        self.assertTrue(self.run_cfg(perf_3m=(-0.20, 0.30))["passed"])
+
+    def test_each_horizon_is_independent(self):
+        res = self.run_cfg(perf_3d=(None, 0.50), perf_1w=(None, -0.90))
+        self.assertEqual(res["reject"], "perf_1w_too_high")
+
+    def test_run_up_excludes_the_event_bar(self):
+        """The gap itself must never count as part of the run-up into it."""
+        res = self.run_cfg()
+        self.assertLess(abs(res["pre_ret_3d"]), 0.05,
+                        "a 22% gap leaked into the 3-day run-up")
