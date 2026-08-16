@@ -43,8 +43,17 @@ DEFAULT_ANTECEDENTS: tuple[str, ...] = (
 class StudyConfig:
     # ---- what counts as an event -------------------------------------------
     event: str = "gap"  # "gap" | "earnings" | "all"
-    min_gap: float = 0.05  # for event="gap": open vs prior close
-    earnings_window: int = 1  # for event="earnings": bars after the date to look at
+    # Two gap measures, both recorded on every event:
+    #   gap          open / prior close - 1   the overnight repricing
+    #   gap_intraday close / open - 1         what happened once it traded
+    # A 12% gap that closes back at the open is a different animal from one
+    # that adds another 5% during the session, so they are kept apart.
+    min_gap: float = 0.05
+    max_gap: float | None = None  # e.g. 0.10 for "between 5% and 10%"
+    # Sessions after the disclosure date that count as the reaction bar. Most
+    # reports land after the close or before the open, so the market's answer
+    # is the next session — offset 1.
+    earnings_reaction_offset: int = 1
 
     # ---- what makes an event a "mover" -------------------------------------
     outcome_horizon: int = 10  # bars forward
@@ -106,20 +115,27 @@ def collect_events(
     dv = ann["dollar_vol20"].to_numpy(float)
 
     if cfg.event == "earnings":
-        wanted = set(pd.DatetimeIndex(earnings_dates or []).normalize())
-        candidate_bars = [
-            i for i in range(cfg.min_history, n)
-            # The reaction bar is the first session on/after the disclosure.
-            if any(pd.Timestamp(ann.index[j]).normalize() in wanted
-                   for j in range(max(0, i - cfg.earnings_window), i + 1))
-        ]
+        # Map each disclosure to the session the market reacts in, then step
+        # forward by the offset. Using searchsorted means a report published on
+        # a weekend or a holiday still lands on the next real session.
+        wanted = pd.DatetimeIndex(sorted(set(pd.DatetimeIndex(earnings_dates or []).normalize())))
+        candidate_bars = []
+        for d in wanted:
+            pos = int(ann.index.searchsorted(d))
+            bar = pos + cfg.earnings_reaction_offset
+            if cfg.min_history <= bar < n:
+                candidate_bars.append(bar)
+        candidate_bars = sorted(set(candidate_bars))
     elif cfg.event == "all":
         candidate_bars = list(range(cfg.min_history, n))
     else:  # "gap"
-        candidate_bars = [
-            i for i in range(cfg.min_history, n)
-            if c[i - 1] > 0 and (o[i] / c[i - 1] - 1.0) >= cfg.min_gap
-        ]
+        candidate_bars = []
+        for i in range(cfg.min_history, n):
+            if c[i - 1] <= 0:
+                continue
+            g = o[i] / c[i - 1] - 1.0
+            if g >= cfg.min_gap and (cfg.max_gap is None or g <= cfg.max_gap):
+                candidate_bars.append(i)
 
     events: list[dict[str, Any]] = []
     last_bar = -10**9
@@ -135,11 +151,21 @@ def collect_events(
             continue
 
         prev = i - 1  # antecedents as of the close before the event
+        gap = o[i] / c[i - 1] - 1.0 if c[i - 1] > 0 else np.nan
+        # On an earnings event the gap band is applied here rather than when
+        # picking candidates, because the candidate is fixed by the calendar.
+        if cfg.event == "earnings" and np.isfinite(gap):
+            if gap < cfg.min_gap or (cfg.max_gap is not None and gap > cfg.max_gap):
+                continue
+
         row: dict[str, Any] = {
             "symbol": symbol,
             "date": date,
             "bar": i,
-            "gap": o[i] / c[i - 1] - 1.0 if c[i - 1] > 0 else np.nan,
+            "gap": gap,
+            "gap_intraday": c[i] / o[i] - 1.0 if o[i] > 0 else np.nan,
+            "gap_high": h[i] / c[i - 1] - 1.0 if c[i - 1] > 0 else np.nan,
+            "held_the_gap": bool(np.isfinite(gap) and c[i] >= o[i]),
             "event_day_return": c[i] / c[i - 1] - 1.0 if c[i - 1] > 0 else np.nan,
         }
         for name in cfg.antecedents:
@@ -290,8 +316,10 @@ def run(
         "base_rate": round(movers / len(events), 4),
         "outcome": f"fwd {cfg.outcome_horizon}d >= {cfg.outcome_threshold:.0%}",
         "event_definition": (
-            f"gap >= {cfg.min_gap:.0%}" if cfg.event == "gap"
-            else "earnings date" if cfg.event == "earnings" else "every bar"
+            f"gap {cfg.min_gap:.0%}"
+            + (f"-{cfg.max_gap:.0%}" if cfg.max_gap is not None else "+")
+            + (" on the session after a report" if cfg.event == "earnings" else "")
+            if cfg.event in ("gap", "earnings") else "every bar"
         ),
         "avg_fwd_movers": round(float(events.loc[events["is_mover"], "fwd_return"].mean()), 4),
         "avg_fwd_others": round(float(events.loc[~events["is_mover"], "fwd_return"].mean()), 4),

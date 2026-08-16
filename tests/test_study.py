@@ -238,3 +238,88 @@ class TestEarningsCalendar(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGapBand(unittest.TestCase):
+    """A 5-10% gap up is a band, not a floor — the upper bound must bind."""
+
+    def setUp(self):
+        self.frames = planted_universe(n_symbols=8, seed=2)
+
+    def _events(self, lo, hi=None):
+        cfg = study_mod.StudyConfig(event="gap", min_gap=lo, max_gap=hi,
+                                    outcome_horizon=10, outcome_threshold=0.20)
+        return study_mod.run(self.frames, cfg).events
+
+    def test_upper_bound_excludes_bigger_gaps(self):
+        wide = self._events(0.05)
+        narrow = self._events(0.05, 0.09)
+        self.assertGreater(len(wide), 0)
+        self.assertLess(len(narrow), len(wide))
+        if len(narrow):
+            self.assertLessEqual(narrow["gap"].max(), 0.09 + 1e-9)
+
+    def test_band_is_inclusive_at_both_ends(self):
+        ev = self._events(0.05, 0.20)
+        if len(ev):
+            self.assertGreaterEqual(ev["gap"].min(), 0.05 - 1e-9)
+            self.assertLessEqual(ev["gap"].max(), 0.20 + 1e-9)
+
+    def test_an_empty_band_yields_no_events_rather_than_erroring(self):
+        self.assertEqual(len(self._events(0.90, 0.95)), 0)
+
+    def test_both_gap_measures_are_recorded(self):
+        ev = self._events(0.05)
+        for col in ("gap", "gap_intraday", "gap_high", "held_the_gap"):
+            self.assertIn(col, ev.columns)
+
+    def test_intraday_gap_is_close_over_open(self):
+        """The overnight gap and what happened after the open are different things."""
+        cfg = study_mod.StudyConfig(event="gap", min_gap=0.05, outcome_horizon=10)
+        sym, ann = next(iter(self.frames.items()))
+        ev = study_mod.collect_events(ann, sym, cfg)
+        self.assertTrue(ev)
+        e = ev[0]
+        o = float(ann["open"].iloc[e["bar"]])
+        c = float(ann["close"].iloc[e["bar"]])
+        self.assertAlmostEqual(e["gap_intraday"], c / o - 1.0, places=9)
+
+
+class TestEarningsReactionBar(unittest.TestCase):
+    """A report published on day D is answered by the market on D+1."""
+
+    def setUp(self):
+        self.frames = planted_universe(n_symbols=6, seed=8)
+        self.sym, self.ann = next(iter(self.frames.items()))
+
+    def test_event_lands_the_session_after_the_disclosure(self):
+        disclosure = self.ann.index[400]
+        cfg = study_mod.StudyConfig(event="earnings", min_gap=-1.0, outcome_horizon=5,
+                                    cooldown=0, min_history=200)
+        ev = study_mod.collect_events(self.ann, self.sym, cfg, earnings_dates=[disclosure])
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["date"], self.ann.index[401])
+
+    def test_offset_zero_uses_the_disclosure_day_itself(self):
+        disclosure = self.ann.index[400]
+        cfg = study_mod.StudyConfig(event="earnings", min_gap=-1.0, outcome_horizon=5,
+                                    cooldown=0, min_history=200, earnings_reaction_offset=0)
+        ev = study_mod.collect_events(self.ann, self.sym, cfg, earnings_dates=[disclosure])
+        self.assertEqual(ev[0]["date"], self.ann.index[400])
+
+    def test_a_weekend_disclosure_still_finds_a_session(self):
+        """searchsorted must land on the next real bar, not fall off the calendar."""
+        weekend = self.ann.index[400] + pd.Timedelta(days=1)
+        while weekend.weekday() < 5:
+            weekend += pd.Timedelta(days=1)
+        cfg = study_mod.StudyConfig(event="earnings", min_gap=-1.0, outcome_horizon=5,
+                                    cooldown=0, min_history=200)
+        ev = study_mod.collect_events(self.ann, self.sym, cfg, earnings_dates=[weekend])
+        self.assertEqual(len(ev), 1)
+
+    def test_gap_band_applies_to_the_reaction_bar(self):
+        cfg = study_mod.StudyConfig(event="earnings", min_gap=0.95, outcome_horizon=5,
+                                    cooldown=0, min_history=200)
+        ev = study_mod.collect_events(self.ann, self.sym, cfg,
+                                      earnings_dates=[self.ann.index[400]])
+        self.assertEqual(ev, [], "a 95% gap floor should exclude an ordinary reaction")

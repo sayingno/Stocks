@@ -29,6 +29,7 @@ from .outcomes import TradeRules, forward_returns, simulate_trade, summarise
 from . import earnings as earnings_mod
 from . import ingest as ingest_mod
 from . import study as study_mod
+from . import summary as summary_mod
 from . import portfolio, setups, strength
 from .portfolio import PortfolioConfig
 from .report import build_report
@@ -359,6 +360,58 @@ def cmd_history(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_summary(args: argparse.Namespace) -> int:
+    """Inventory the price database: what is in it, and is any of it usable?"""
+    store = _make_store(args)
+    if store.repo is not None:
+        symbols = store.repo.symbols()
+    else:
+        symbols = universe_mod.load(args.universe)
+    if not symbols:
+        raise DataError("no symbols found — ingest or update first")
+
+    print(f"reading {len(symbols)} symbols from {store.name} …", file=sys.stderr)
+    frames: dict[str, pd.DataFrame] = {}
+    failed = 0
+    for n, sym in enumerate(symbols, 1):
+        if args.verbose and n % 500 == 0:
+            print(f"  {n}/{len(symbols)}", file=sys.stderr)
+        try:
+            df = store.get(sym, "1900-01-01", "2100-01-01")
+        except Exception:
+            failed += 1
+            continue
+        if df is not None and not df.empty:
+            frames[sym] = df
+
+    result = summary_mod.summarise(frames, min_bars=args.min_bars)
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    result.per_symbol.to_csv(outdir / "dataset_symbols.csv", index=False)
+    payload = {
+        "overview": result.overview,
+        "warnings": result.warnings,
+        "unreadable_symbols": failed,
+        "suggested_thresholds": summary_mod.suggest_thresholds(result),
+    }
+    (outdir / "dataset_summary.json").write_text(json.dumps(payload, indent=2, default=str))
+
+    print(json.dumps(payload, indent=2, default=str))
+    if result.warnings:
+        print("\n── worth checking ──", file=sys.stderr)
+        for w in result.warnings:
+            print(f"  ! {w}", file=sys.stderr)
+    print(f"\nper-symbol table -> {outdir}/dataset_symbols.csv", file=sys.stderr)
+    print()
+    _print_table(
+        result.per_symbol.sort_values("median_dollar_vol", ascending=False),
+        ["symbol", "bars", "first", "last", "years", "coverage", "last_close",
+         "median_dollar_vol", "median_adr_pct", "suspect_jumps"],
+        args.limit,
+    )
+    return 0
+
+
 def cmd_study(args: argparse.Namespace) -> int:
     """Event study: what did the big movers look like before they moved?"""
     setup = _setup(args)
@@ -379,6 +432,7 @@ def cmd_study(args: argparse.Namespace) -> int:
     scfg = study_mod.StudyConfig(
         event=args.event,
         min_gap=args.min_gap,
+        max_gap=args.max_gap,
         outcome_horizon=args.horizon,
         outcome_threshold=args.mover_threshold,
         min_dollar_volume=cfg.min_dollar_volume if args.apply_liquidity else 0.0,
@@ -876,7 +930,10 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--years", type=int, default=5)
     st.add_argument("--event", choices=["gap", "earnings", "all"], default="gap",
                     help="what raises an event")
-    st.add_argument("--min-gap", type=float, default=0.05, help="for --event gap")
+    st.add_argument("--min-gap", type=float, default=0.05,
+                    help="lower bound on the gap (open vs prior close)")
+    st.add_argument("--max-gap", type=float, default=None,
+                    help="upper bound, e.g. --min-gap 0.05 --max-gap 0.10 for a 5-10%% gap up")
     st.add_argument("--earnings", default=None, metavar="CSV",
                     help="earnings calendar (symbol,date)")
     st.add_argument("--infer-earnings", action="store_true",
@@ -890,6 +947,12 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--apply-liquidity", action="store_true",
                     help="also require the preset's dollar-volume floor")
     st.set_defaults(func=cmd_study)
+
+    sm = sub.add_parser("summary", help="inventory the dataset: tickers, coverage, liquidity, warnings")
+    _common(sm)
+    sm.add_argument("--universe", default="sample", help="ignored when --repo is given")
+    sm.add_argument("--min-bars", type=int, default=200, help="bars needed to call a symbol usable")
+    sm.set_defaults(func=cmd_summary)
 
     g = sub.add_parser("ingest", help="load vendor zips / folders / a long CSV into the price database")
     _common(g)
